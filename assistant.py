@@ -71,6 +71,8 @@ waiting_for_user_input = False  # Flag to indicate when the assistant is waiting
 max_silence_before_prompt = 10.0  # Maximum silence time before prompting user again
 wake_word = "hey maxwell"  # Wake word to activate the assistant
 wake_word_active = False  # Flag to indicate if the wake word has been detected
+pending_user_input = None  # Store user input received while speaking
+listen_while_speaking = True  # Whether to listen while speaking
 
 class OllamaClient:
     """Client for interacting with Ollama API using the official Python client."""
@@ -783,15 +785,16 @@ class SpeechRecognizer:
         Returns:
             Recognized text or None if no speech detected
         """
-        global is_speaking, last_speaking_time, speaking_cooldown
+        global is_speaking, last_speaking_time, speaking_cooldown, listen_while_speaking
         
-        # Don't listen while speaking
-        if is_speaking:
+        # Don't listen while speaking if the feature is disabled
+        if is_speaking and not listen_while_speaking:
             return None
-            
-        # Don't listen during cooldown period after speaking
+        
+        # Don't listen during cooldown period after speaking, unless we're currently speaking
+        # This allows listening while speaking but prevents immediate listening after speech ends
         time_since_speaking = time.time() - last_speaking_time
-        if time_since_speaking < speaking_cooldown:
+        if not is_speaking and time_since_speaking < speaking_cooldown:
             logger.debug(f"In cooldown period ({time_since_speaking:.2f}s < {speaking_cooldown}s), skipping listening")
             return None
         
@@ -809,7 +812,7 @@ class SpeechRecognizer:
                     logger.error("Offline recognition requested but Vosk recognizer not initialized")
                     return None
                     
-                return self.offline_recognizer.listen_for_speech(timeout=timeout or 15.0)  # Longer timeout
+                return self.offline_recognizer.listen_for_speech(timeout=timeout or 15.0)  # Use provided timeout or default
             else:
                 # Use online recognition
                 if source is None:
@@ -834,7 +837,7 @@ class SpeechRecognizer:
                 logger.debug(f"Listening for speech with parameters: pause_threshold={self.pause_threshold}s, phrase_time_limit={self.phrase_time_limit}s")
                 audio = self.recognizer.listen(
                     source, 
-                    timeout=timeout or 15.0,  # Longer timeout
+                    timeout=timeout or 15.0,  # Use provided timeout or default
                     phrase_time_limit=self.phrase_time_limit,  # Use configured phrase time limit
                     snowboy_configuration=None
                 )
@@ -869,6 +872,84 @@ class SpeechRecognizer:
             logger.error(f"Error in speech recognition: {e}")
             return None
 
+def download_file(url, destination, description=None):
+    """Download a file with progress reporting.
+    
+    Args:
+        url: URL to download from
+        destination: Path to save the file to
+        description: Optional description of the file
+        
+    Returns:
+        True if download was successful, False otherwise
+    """
+    try:
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(os.path.abspath(destination)), exist_ok=True)
+        
+        # Start the download
+        desc = description or os.path.basename(destination)
+        logger.info(f"Downloading {desc} from {url}...")
+        
+        # Try to use wget if available (better progress reporting and resume capability)
+        try:
+            import subprocess
+            
+            # Check if wget is available
+            try:
+                subprocess.run(["wget", "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+                
+                # Use wget for downloading
+                logger.info(f"Using wget to download {desc}")
+                result = subprocess.run(
+                    ["wget", "-c", url, "-O", destination, "--progress=bar:force"],
+                    check=True
+                )
+                
+                if result.returncode == 0:
+                    logger.info(f"Successfully downloaded {desc} to {destination}")
+                    return True
+                else:
+                    logger.warning(f"wget failed with code {result.returncode}, falling back to requests")
+            except (subprocess.SubprocessError, FileNotFoundError):
+                logger.info("wget not available, using requests for download")
+        except ImportError:
+            logger.info("subprocess module not available, using requests for download")
+        
+        # Fallback to requests if wget is not available or failed
+        # Make the request with stream=True to download in chunks
+        response = requests.get(url, stream=True)
+        response.raise_for_status()  # Raise an exception for HTTP errors
+        
+        # Get the total file size if available
+        total_size = int(response.headers.get('content-length', 0))
+        
+        # Initialize progress variables
+        downloaded = 0
+        chunk_size = 1024 * 1024  # 1MB chunks
+        last_percent = 0
+        
+        # Open the file for writing
+        with open(destination, 'wb') as f:
+            # Download in chunks and report progress
+            for chunk in response.iter_content(chunk_size=chunk_size):
+                if chunk:  # Filter out keep-alive chunks
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    
+                    # Report progress
+                    if total_size > 0:
+                        percent = int(downloaded * 100 / total_size)
+                        if percent >= last_percent + 10:  # Report every 10%
+                            logger.info(f"Downloaded {percent}% of {desc}")
+                            last_percent = percent
+        
+        logger.info(f"Successfully downloaded {desc} to {destination}")
+        return True
+    except Exception as e:
+        logger.error(f"Error downloading {description or url}: {e}")
+        return False
+
 class KokoroTTS:
     """Text-to-speech using Kokoro."""
     
@@ -886,6 +967,7 @@ class KokoroTTS:
             skip_init: Skip initialization (for testing)
             auto_download: Automatically download missing files after confirmation
         """
+        self.on_speech_finished = None  # Callback for when speech is finished
         if skip_init:
             logger.warning("Skipping TTS initialization (for testing only)")
             self.kokoro = None
@@ -909,20 +991,44 @@ class KokoroTTS:
             logger.warning(f"Voices file not found: {voices_path}")
             files_to_download.append(("voices", voices_path, voices_url))
         
-        # If files are missing and auto_download is enabled, download them
+        # If files are missing, handle download
         if files_to_download:
+            # Print information about missing files
+            print("\n" + "="*50)
+            print("KOKORO TTS MODEL FILES MISSING")
+            print("="*50)
+            print("\nThe following files are needed for text-to-speech:")
+            for file_type, path, url in files_to_download:
+                print(f"- {file_type.capitalize()} file: {path}")
+            
+            # Approximate file sizes
+            print("\nApproximate file sizes:")
+            print("- Model file: ~40 MB")
+            print("- Voices file: ~15 MB")
+            
             if auto_download:
-                # Ask for confirmation
-                print("\nThe following files are missing and need to be downloaded:")
+                print("\nAuto-download is enabled. The files will be downloaded automatically.")
+                
+                # Download the files
+                download_success = True
                 for file_type, path, url in files_to_download:
-                    print(f"- {file_type.capitalize()} file: {path}")
+                    if not download_file(url, path, f"{file_type} file"):
+                        download_success = False
+                        break
                 
-                # Approximate file sizes
-                print("\nApproximate file sizes:")
-                print("- Model file: ~40 MB")
-                print("- Voices file: ~15 MB")
-                
-                confirmation = input("\nDo you want to download these files now? (y/n): ").strip().lower()
+                if not download_success:
+                    logger.error("Failed to download required files")
+                    print("\nFailed to download required files. You can:")
+                    print("1. Download them manually:")
+                    for _, path, url in files_to_download:
+                        print(f"   - {url} -> {path}")
+                    print("2. Run with --no-tts to disable text-to-speech")
+                    print("3. Run with --auto-download to try downloading again")
+                    sys.exit(1)
+            else:
+                # Ask for confirmation
+                print("\nWould you like to download these files now? (y/n)")
+                confirmation = input("Enter 'y' to download or 'n' to exit: ").strip().lower()
                 
                 if confirmation in ('y', 'yes'):
                     # Download the files
@@ -934,27 +1040,22 @@ class KokoroTTS:
                     
                     if not download_success:
                         logger.error("Failed to download required files")
-                        logger.info("You can download them manually:")
-                        logger.info(f"- Model file: {model_url}")
-                        logger.info(f"- Voices file: {voices_url}")
-                        logger.info("Or run with --no-tts to skip TTS initialization for testing")
+                        print("\nFailed to download required files. You can:")
+                        print("1. Download them manually:")
+                        for _, path, url in files_to_download:
+                            print(f"   - {url} -> {path}")
+                        print("2. Run with --no-tts to disable text-to-speech")
+                        print("3. Run with --auto-download to try downloading again")
                         sys.exit(1)
                 else:
                     logger.info("Download cancelled")
-                    logger.info("You can download them manually:")
-                    logger.info(f"- Model file: {model_url}")
-                    logger.info(f"- Voices file: {voices_url}")
-                    logger.info("Or run with --no-tts to skip TTS initialization for testing")
+                    print("\nDownload cancelled. You can:")
+                    print("1. Download the files manually:")
+                    for _, path, url in files_to_download:
+                        print(f"   - {url} -> {path}")
+                    print("2. Run with --no-tts to disable text-to-speech")
+                    print("3. Run with --auto-download to download automatically next time")
                     sys.exit(1)
-            else:
-                # Just show download instructions
-                logger.error("Required files are missing")
-                logger.info("You can download them manually:")
-                logger.info(f"- Model file: {model_url}")
-                logger.info(f"- Voices file: {voices_url}")
-                logger.info("Or run with --auto-download to download them automatically")
-                logger.info("Or run with --no-tts to skip TTS initialization for testing")
-                sys.exit(1)
         
         try:
             self.kokoro = Kokoro(model_path, voices_path)
@@ -1088,7 +1189,7 @@ class KokoroTTS:
         Args:
             text: Text to speak
         """
-        global is_speaking, last_speaking_time, waiting_for_user_input
+        global is_speaking, last_speaking_time, waiting_for_user_input, pending_user_input
         
         if not text or not text.strip():
             return
@@ -1098,6 +1199,10 @@ class KokoroTTS:
             logger.info(f"Would speak (TTS disabled): {text}")
             last_speaking_time = time.time()  # Update last speaking time even when TTS is disabled
             waiting_for_user_input = True  # Ready for user input after "speaking"
+            
+            # Call the speech finished callback if set
+            if self.on_speech_finished:
+                self.on_speech_finished()
             return
         
         # Set speaking flag
@@ -1179,6 +1284,10 @@ class KokoroTTS:
             is_speaking = False
             last_speaking_time = time.time()  # Record when speaking finished
             waiting_for_user_input = True  # Ready for user input after speaking
+            
+            # Call the speech finished callback if set
+            if self.on_speech_finished:
+                self.on_speech_finished()
     
     def stream_speak(self, text_chunk):
         """Convert a chunk of text to speech and play it immediately.
@@ -1312,11 +1421,12 @@ class ConversationalAssistant:
     """Main class for the conversational assistant."""
     
     def __init__(self, ollama_model="dolphin-llama3:8b-v2.9-q4_0", tts_voice="bm_lewis", 
-                 language="en-us", speed=1.0, vad_aggressiveness=3,
+                 language="en-us", speed=1.25, vad_aggressiveness=3,
                  use_offline_recognition=False, vosk_model_path="vosk-model-small-en-us",
                  skip_tts=False, skip_speech=False, energy_threshold=300, 
                  use_wake_word=True, custom_wake_word=None, listen_timeout=15.0,
-                 pause_threshold=2.0, phrase_time_limit=15.0, auto_download=False):
+                 pause_threshold=2.0, phrase_time_limit=15.0, auto_download=False,
+                 enable_listen_while_speaking=True):
         """Initialize the conversational assistant.
         
         Args:
@@ -1336,6 +1446,7 @@ class ConversationalAssistant:
             pause_threshold: Pause threshold in seconds for speech recognition
             phrase_time_limit: Maximum phrase time limit in seconds
             auto_download: Automatically download missing model files after confirmation
+            enable_listen_while_speaking: Whether to listen while speaking
         """
         # Initialize Ollama client
         self.ollama = OllamaClient(model=ollama_model)
@@ -1344,12 +1455,14 @@ class ConversationalAssistant:
         self.skip_tts = skip_tts
         if not skip_tts:
             self.tts = KokoroTTS(voice=tts_voice, language=language, speed=speed, auto_download=auto_download)
+            # Set the callback for when speech is finished
+            self.tts.on_speech_finished = self._process_pending_input
         else:
             # Create a dummy TTS object that does nothing
             logger.info("Skipping TTS initialization")
             self.tts = None
         
-        # Initialize speech recognizer only if not skipping
+        # Initialize speech recognition only if not skipping
         self.skip_speech = skip_speech
         if not skip_speech:
             self.recognizer = SpeechRecognizer(
@@ -1390,6 +1503,10 @@ class ConversationalAssistant:
         
         # Conversation mode flag
         self.conversation_mode = False
+        
+        # Set global flag for listening while speaking
+        global listen_while_speaking
+        listen_while_speaking = enable_listen_while_speaking
         
         logger.info(f"Conversational assistant initialized{' with wake word: ' + wake_word if use_wake_word else ''}")
         logger.info(f"Listen timeout set to {self.listen_timeout} seconds")
@@ -1627,7 +1744,7 @@ class ConversationalAssistant:
         Args:
             text_input: Optional text input to process (for testing)
         """
-        global stop_listening, waiting_for_user_input, max_silence_before_prompt, wake_word_active
+        global stop_listening, waiting_for_user_input, max_silence_before_prompt, wake_word_active, pending_user_input
         
         # Initial greeting
         greeting = "Hello! I'm Maxwell, your voice assistant. Say 'Hey Maxwell' to activate me."
@@ -1709,46 +1826,29 @@ class ConversationalAssistant:
             waiting_for_user_input = True
             while not stop_listening:
                 try:
-                    # Check if we're currently speaking
-                    if is_speaking:
-                        # Don't listen while speaking
-                        time.sleep(0.1)
-                        continue
+                    # Check if we should listen for user input
+                    # Note: We now always listen, even when speaking
                     
-                    # Only listen when waiting for user input
-                    if waiting_for_user_input:
-                        # Check if we should prompt the user after a period of silence
-                        current_time = time.time()
-                        time_since_last_input = current_time - last_user_input_time
-                        time_since_last_speaking = current_time - last_speaking_time
+                    # Listen for speech with the configured timeout
+                    speech_text = None
+                    if self.recognizer.use_offline:
+                        # Offline recognition doesn't need a source
+                        speech_text = self.recognizer.listen_for_speech(timeout=self.listen_timeout)
+                    else:
+                        # Online recognition needs a source
+                        with mic as source:
+                            speech_text = self.recognizer.listen_for_speech(source, timeout=self.listen_timeout)
+                    
+                    if speech_text:
+                        # Update the last input time
+                        last_user_input_time = time.time()
                         
-                        # If wake word is active or in conversation mode and it's been a while since the last interaction
-                        if (self.use_wake_word and (wake_word_active or self.conversation_mode) and 
-                            time_since_last_input > 60 and time_since_last_speaking > 10):
-                            # Prompt the user
-                            prompt_message = "Is there anything else you'd like help with? Say 'end convo' to exit conversation mode."
-                            logger.info(f"Prompting user: {prompt_message}")
-                            
-                            if not self.skip_tts and self.tts is not None:
-                                self.tts.speak(prompt_message)
-                            
-                            # Reset the timer
-                            last_user_input_time = time.time()
-                        
-                        # Listen for speech with the configured timeout
-                        speech_text = None
-                        if self.recognizer.use_offline:
-                            # Offline recognition doesn't need a source
-                            speech_text = self.recognizer.listen_for_speech(timeout=self.listen_timeout)
+                        # If we're currently speaking, store the input to process after speaking
+                        if is_speaking:
+                            logger.info(f"Received input while speaking, will process after current speech: {speech_text}")
+                            pending_user_input = speech_text
                         else:
-                            # Online recognition needs a source
-                            with mic as source:
-                                speech_text = self.recognizer.listen_for_speech(source, timeout=self.listen_timeout)
-                        
-                        if speech_text:
-                            # Update the last input time
-                            last_user_input_time = time.time()
-                            
+                            # We're not speaking, process immediately
                             # We're no longer waiting for user input while processing
                             waiting_for_user_input = False
                             
@@ -1766,13 +1866,40 @@ class ConversationalAssistant:
                             # After processing, we're waiting for user input again
                             waiting_for_user_input = True
                     else:
-                        # Small sleep when speaking or not waiting for input to reduce CPU usage
+                        # Small sleep to reduce CPU usage when no speech detected
                         time.sleep(0.1)
                 except KeyboardInterrupt:
                     logger.info("Keyboard interrupt detected")
                     break
         
         logger.info("Conversational assistant stopped")
+    
+    def _process_pending_input(self):
+        """Process any pending user input that was received while speaking."""
+        global pending_user_input, waiting_for_user_input
+        
+        if pending_user_input:
+            logger.info(f"Processing pending user input: {pending_user_input}")
+            
+            # We're no longer waiting for user input while processing
+            waiting_for_user_input = False
+            
+            # Process in a separate thread to allow interruption
+            processing_thread = threading.Thread(
+                target=self.process_speech_to_response,
+                args=(pending_user_input,)
+            )
+            processing_thread.daemon = True
+            processing_thread.start()
+            
+            # Wait for processing to complete
+            processing_thread.join()
+            
+            # Clear the pending input
+            pending_user_input = None
+            
+            # After processing, we're waiting for user input again
+            waiting_for_user_input = True
 
 def handle_interrupt(signum, frame):
     """Handle interrupt signal."""
@@ -1790,58 +1917,6 @@ def handle_interrupt(signum, frame):
     # Set flag to stop listening
     stop_listening = True
 
-def download_file(url, destination, description=None):
-    """Download a file with progress reporting.
-    
-    Args:
-        url: URL to download from
-        destination: Path to save the file to
-        description: Optional description of the file
-        
-    Returns:
-        True if download was successful, False otherwise
-    """
-    try:
-        # Create directory if it doesn't exist
-        os.makedirs(os.path.dirname(os.path.abspath(destination)), exist_ok=True)
-        
-        # Start the download
-        desc = description or os.path.basename(destination)
-        logger.info(f"Downloading {desc} from {url}...")
-        
-        # Make the request with stream=True to download in chunks
-        response = requests.get(url, stream=True)
-        response.raise_for_status()  # Raise an exception for HTTP errors
-        
-        # Get the total file size if available
-        total_size = int(response.headers.get('content-length', 0))
-        
-        # Initialize progress variables
-        downloaded = 0
-        chunk_size = 1024 * 1024  # 1MB chunks
-        last_percent = 0
-        
-        # Open the file for writing
-        with open(destination, 'wb') as f:
-            # Download in chunks and report progress
-            for chunk in response.iter_content(chunk_size=chunk_size):
-                if chunk:  # Filter out keep-alive chunks
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    
-                    # Report progress
-                    if total_size > 0:
-                        percent = int(downloaded * 100 / total_size)
-                        if percent >= last_percent + 10:  # Report every 10%
-                            logger.info(f"Downloaded {percent}% of {desc}")
-                            last_percent = percent
-        
-        logger.info(f"Successfully downloaded {desc} to {destination}")
-        return True
-    except Exception as e:
-        logger.error(f"Error downloading {description or url}: {e}")
-        return False
-
 def main():
     """Main function."""
     # Parse command line arguments
@@ -1853,8 +1928,8 @@ def main():
                         help="Voice for text-to-speech (default: bm_lewis)")
     parser.add_argument("--language", type=str, default="en-us",
                         help="Language for speech recognition and TTS (default: en-us)")
-    parser.add_argument("--speed", type=float, default=1.0,
-                        help="Speech speed (default: 1.0)")
+    parser.add_argument("--speed", type=float, default=1.25,
+                        help="Speech speed (default: 1.25)")
     parser.add_argument("--vad-level", type=int, choices=[0, 1, 2, 3], default=3,
                         help="VAD aggressiveness level (0-3, default: 3)")
     parser.add_argument("--offline", action="store_true",
@@ -1889,6 +1964,8 @@ def main():
                         help="Maximum phrase time limit in seconds (default: 15.0)")
     parser.add_argument("--auto-download", action="store_true",
                         help="Automatically download missing model files after confirmation")
+    parser.add_argument("--no-listen-while-speaking", action="store_true",
+                        help="Disable listening while speaking (default: enabled)")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging")
     
@@ -1951,7 +2028,8 @@ def main():
         listen_timeout=args.listen_timeout,
         pause_threshold=args.pause_threshold,
         phrase_time_limit=args.phrase_time_limit,
-        auto_download=args.auto_download
+        auto_download=args.auto_download,
+        enable_listen_while_speaking=not args.no_listen_while_speaking
     )
     
     try:
