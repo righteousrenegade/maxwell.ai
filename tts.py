@@ -46,6 +46,8 @@ class KokoroTTS:
         """Initialize Kokoro TTS."""
         self.on_speech_finished = None  # Callback for when speech is finished
         self.on_speech_interrupted = None  # Callback for when speech is interrupted
+        self.current_stream = None  # Reference to the current audio stream
+        
         if skip_init:
             logger.warning("Skipping TTS initialization (for testing only)")
             self.kokoro = None
@@ -246,6 +248,43 @@ class KokoroTTS:
             
         return chunks
     
+    def _check_for_interrupt(self, stream, interval=0.05):
+        """Check for interrupt flag at regular intervals.
+        
+        Args:
+            stream: Audio stream to stop if interrupted
+            interval: Check interval in seconds
+        """
+        global is_interrupted
+        
+        while stream.active and not is_interrupted:
+            time.sleep(interval)  # Check more frequently for better responsiveness
+            
+        if is_interrupted and stream.active:
+            logger.info("Interrupt detected, stopping audio stream")
+            stream.stop()
+            
+            # Call the speech interrupted callback if set
+            if self.on_speech_interrupted:
+                self.on_speech_interrupted()
+    
+    def _wait_for_stream(self, stream, samples, sample_rate, interval=0.05):
+        """Wait for the audio stream to finish playing.
+        
+        Args:
+            stream: Audio stream to wait for
+            samples: Audio samples
+            sample_rate: Sample rate
+            interval: Check interval in seconds
+        """
+        # Calculate the expected duration of the audio
+        duration = len(samples) / sample_rate
+        
+        # Wait for the expected duration plus a small buffer
+        start_time = time.time()
+        while stream.active and time.time() - start_time < duration + 0.5:
+            time.sleep(interval)
+    
     def speak(self, text):
         """Convert text to speech and play it.
         
@@ -280,6 +319,7 @@ class KokoroTTS:
             for chunk in chunks:
                 # Check if we should stop speaking
                 if is_interrupted:
+                    logger.info("Speech interrupted before chunk processing")
                     break
                 
                 logger.debug(f"Speaking chunk: {chunk[:50]}...")
@@ -294,27 +334,40 @@ class KokoroTTS:
                     
                     # Play the audio with a way to interrupt
                     try:
-                        sd.play(samples, sample_rate)
+                        # Start the audio stream
+                        stream = sd.OutputStream(
+                            samplerate=sample_rate,
+                            channels=1,
+                            callback=None,
+                            finished_callback=None
+                        )
+                        stream.start()
+                        self.current_stream = stream
                         
-                        # Wait for audio to finish, but check for interrupts
-                        start_time = time.time()
-                        while sd.get_stream().active and time.time() - start_time < len(samples) / sample_rate + 0.5:
-                            # Small sleep to reduce CPU usage
-                            time.sleep(0.1)
+                        # Write the samples to the stream
+                        stream.write(samples)
+                        
+                        # Start a separate thread to check for interrupts
+                        interrupt_thread = threading.Thread(
+                            target=self._check_for_interrupt,
+                            args=(stream, 0.05)  # Check every 50ms for better responsiveness
+                        )
+                        interrupt_thread.daemon = True
+                        interrupt_thread.start()
+                        
+                        # Wait for the audio to finish or be interrupted
+                        self._wait_for_stream(stream, samples, sample_rate, 0.05)
+                        
+                        # Check if we were interrupted
+                        if is_interrupted:
+                            logger.info("Speech interrupted during playback")
+                            break
                             
-                            # Check for interruption
-                            if is_interrupted:
-                                logger.info("Speech interrupted by interrupt word")
-                                sd.stop()
-                                
-                                # Call the speech interrupted callback if set
-                                if self.on_speech_interrupted:
-                                    self.on_speech_interrupted()
-                                break
                     except KeyboardInterrupt:
                         # Stop audio on keyboard interrupt
-                        logger.info("Speech interrupted by user")
-                        sd.stop()
+                        logger.info("Speech interrupted by keyboard")
+                        if stream.active:
+                            stream.stop()
                         break
                 except TypeError as e:
                     # If we get a TypeError, it might be because the create method has different parameters
@@ -325,27 +378,40 @@ class KokoroTTS:
                         
                         # Play the audio with a way to interrupt
                         try:
-                            sd.play(samples, sample_rate)
+                            # Start the audio stream
+                            stream = sd.OutputStream(
+                                samplerate=sample_rate,
+                                channels=1,
+                                callback=None,
+                                finished_callback=None
+                            )
+                            stream.start()
+                            self.current_stream = stream
                             
-                            # Wait for audio to finish, but check for interrupts
-                            start_time = time.time()
-                            while sd.get_stream().active and time.time() - start_time < len(samples) / sample_rate + 0.5:
-                                # Small sleep to reduce CPU usage
-                                time.sleep(0.1)
+                            # Write the samples to the stream
+                            stream.write(samples)
+                            
+                            # Start a separate thread to check for interrupts
+                            interrupt_thread = threading.Thread(
+                                target=self._check_for_interrupt,
+                                args=(stream, 0.05)  # Check every 50ms for better responsiveness
+                            )
+                            interrupt_thread.daemon = True
+                            interrupt_thread.start()
+                            
+                            # Wait for the audio to finish or be interrupted
+                            self._wait_for_stream(stream, samples, sample_rate, 0.05)
+                            
+                            # Check if we were interrupted
+                            if is_interrupted:
+                                logger.info("Speech interrupted during playback")
+                                break
                                 
-                                # Check for interruption
-                                if is_interrupted:
-                                    logger.info("Speech interrupted by interrupt word")
-                                    sd.stop()
-                                    
-                                    # Call the speech interrupted callback if set
-                                    if self.on_speech_interrupted:
-                                        self.on_speech_interrupted()
-                                    break
                         except KeyboardInterrupt:
                             # Stop audio on keyboard interrupt
-                            logger.info("Speech interrupted by user")
-                            sd.stop()
+                            logger.info("Speech interrupted by keyboard")
+                            if stream.active:
+                                stream.stop()
                             break
                     except Exception as e2:
                         logger.error(f"Error in text-to-speech with default parameters: {e2}")
@@ -356,10 +422,14 @@ class KokoroTTS:
             is_speaking = False
             last_speaking_time = time.time()  # Record when speaking finished
             waiting_for_user_input = True  # Ready for user input after speaking
+            self.current_stream = None  # Clear the current stream reference
             
             # Call the speech finished callback if set
             if not is_interrupted and self.on_speech_finished:
                 self.on_speech_finished()
+            elif is_interrupted and self.on_speech_interrupted:
+                # Ensure the interrupted callback is called if we were interrupted
+                self.on_speech_interrupted()
     
     def stream_speak(self, text_chunk):
         """Convert a chunk of text to speech and play it immediately.
@@ -402,23 +472,40 @@ class KokoroTTS:
                 
                 # Play the audio with a way to interrupt
                 try:
-                    sd.play(samples, sample_rate)
+                    # Start the audio stream
+                    stream = sd.OutputStream(
+                        samplerate=sample_rate,
+                        channels=1,
+                        callback=None,
+                        finished_callback=None
+                    )
+                    stream.start()
+                    self.current_stream = stream
                     
-                    # Wait for audio to finish, but check for interrupts
-                    start_time = time.time()
-                    while sd.get_stream().active and time.time() - start_time < len(samples) / sample_rate + 0.5:
-                        # Small sleep to reduce CPU usage
-                        time.sleep(0.1)
+                    # Write the samples to the stream
+                    stream.write(samples)
+                    
+                    # Start a separate thread to check for interrupts
+                    interrupt_thread = threading.Thread(
+                        target=self._check_for_interrupt,
+                        args=(stream, 0.05)  # Check every 50ms for better responsiveness
+                    )
+                    interrupt_thread.daemon = True
+                    interrupt_thread.start()
+                    
+                    # Wait for the audio to finish or be interrupted
+                    self._wait_for_stream(stream, samples, sample_rate, 0.05)
+                    
+                    # Check if we were interrupted
+                    if is_interrupted:
+                        logger.info("Stream speech interrupted during playback")
+                        return
                         
-                        # Check for interruption
-                        if is_interrupted:
-                            logger.info("Speech interrupted by interrupt word")
-                            sd.stop()
-                            return
                 except KeyboardInterrupt:
                     # Stop audio on keyboard interrupt
-                    logger.info("Speech interrupted by user")
-                    sd.stop()
+                    logger.info("Stream speech interrupted by keyboard")
+                    if stream.active:
+                        stream.stop()
                     return
             except TypeError as e:
                 # If we get a TypeError, it might be because the create method has different parameters
@@ -429,23 +516,40 @@ class KokoroTTS:
                     
                     # Play the audio with a way to interrupt
                     try:
-                        sd.play(samples, sample_rate)
+                        # Start the audio stream
+                        stream = sd.OutputStream(
+                            samplerate=sample_rate,
+                            channels=1,
+                            callback=None,
+                            finished_callback=None
+                        )
+                        stream.start()
+                        self.current_stream = stream
                         
-                        # Wait for audio to finish, but check for interrupts
-                        start_time = time.time()
-                        while sd.get_stream().active and time.time() - start_time < len(samples) / sample_rate + 0.5:
-                            # Small sleep to reduce CPU usage
-                            time.sleep(0.1)
+                        # Write the samples to the stream
+                        stream.write(samples)
+                        
+                        # Start a separate thread to check for interrupts
+                        interrupt_thread = threading.Thread(
+                            target=self._check_for_interrupt,
+                            args=(stream, 0.05)  # Check every 50ms for better responsiveness
+                        )
+                        interrupt_thread.daemon = True
+                        interrupt_thread.start()
+                        
+                        # Wait for the audio to finish or be interrupted
+                        self._wait_for_stream(stream, samples, sample_rate, 0.05)
+                        
+                        # Check if we were interrupted
+                        if is_interrupted:
+                            logger.info("Stream speech interrupted during playback")
+                            return
                             
-                            # Check for interruption
-                            if is_interrupted:
-                                logger.info("Speech interrupted by interrupt word")
-                                sd.stop()
-                                return
                     except KeyboardInterrupt:
                         # Stop audio on keyboard interrupt
-                        logger.info("Speech interrupted by user")
-                        sd.stop()
+                        logger.info("Stream speech interrupted by keyboard")
+                        if stream.active:
+                            stream.stop()
                         return
                 except Exception as e2:
                     logger.error(f"Error in text-to-speech with default parameters: {e2}")
@@ -459,7 +563,10 @@ class KokoroTTS:
         if is_speaking:
             logger.info("Stopping speech")
             is_interrupted = True
-            sd.stop()
+            
+            # Stop the current stream if it exists
+            if self.current_stream is not None and self.current_stream.active:
+                self.current_stream.stop()
             
             # Call the speech interrupted callback if set
             if self.on_speech_interrupted:

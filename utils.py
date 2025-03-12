@@ -51,6 +51,7 @@ available_commands = {
     "reminder": "Set a reminder",
     "timer": "Set a timer",
     "search": "Search the web",
+    "details": "Get more details about a search result by number or title",
 }
 
 def handle_interrupt(sig, frame):

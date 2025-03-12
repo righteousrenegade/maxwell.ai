@@ -379,6 +379,35 @@ class SpeechRecognizer:
             self.keyword_recognizer.energy_threshold = max(self.recognizer.energy_threshold * 0.7, 200)
             logger.info(f"Adjusted keyword energy threshold: {self.keyword_recognizer.energy_threshold}")
     
+    def _check_for_interrupt_word(self, text):
+        """Check if the text contains an interrupt word.
+        
+        Args:
+            text: Text to check
+            
+        Returns:
+            True if the text contains an interrupt word, False otherwise
+        """
+        if not text:
+            return False
+            
+        text_lower = text.lower()
+        
+        # Check for various interrupt phrases
+        interrupt_phrases = [
+            self.interrupt_word,
+            "stop",
+            "shut up",
+            "be quiet",
+            "silence",
+            "quiet",
+            "enough",
+            "pause",
+            "hold on"
+        ]
+        
+        return any(phrase in text_lower for phrase in interrupt_phrases)
+    
     def listen_for_speech(self, source=None, timeout=None):
         """Listen for speech and return the recognized text.
         
@@ -407,11 +436,19 @@ class SpeechRecognizer:
             try:
                 # Use the keyword recognizer with a short timeout
                 logger.debug("Listening for interrupt word...")
+                
+                # Use a much lower energy threshold when speaking to make it easier to detect interrupts
+                original_energy = self.keyword_recognizer.energy_threshold
+                self.keyword_recognizer.energy_threshold = max(original_energy * 0.6, 150)
+                
                 audio = self.keyword_recognizer.listen(
                     source,
-                    timeout=1.0,  # Short timeout for responsiveness
-                    phrase_time_limit=2.0  # Short phrase time for quick detection
+                    timeout=0.5,  # Very short timeout for responsiveness
+                    phrase_time_limit=1.5  # Short phrase time for quick detection
                 )
+                
+                # Restore original energy threshold
+                self.keyword_recognizer.energy_threshold = original_energy
                 
                 # Try to recognize with a shorter timeout
                 try:
@@ -419,7 +456,7 @@ class SpeechRecognizer:
                     text = text.lower()
                     
                     # Check if the text contains the interrupt word
-                    if self.interrupt_word in text or "stop" in text or "shut up" in text:
+                    if self._check_for_interrupt_word(text):
                         logger.info(f"Interrupt word detected: {text}")
                         is_interrupted = True
                         return text
@@ -445,7 +482,16 @@ class SpeechRecognizer:
                 # Use the provided timeout, fall back to self.listen_timeout, or use 15.0 as default
                 effective_timeout = timeout if timeout is not None else self.listen_timeout
                 logger.debug(f"Using timeout: {effective_timeout}s for offline recognition")
-                return self.offline_recognizer.listen_for_speech(timeout=effective_timeout)
+                
+                # Get the speech text
+                speech_text = self.offline_recognizer.listen_for_speech(timeout=effective_timeout)
+                
+                # Check for interrupt word if we're speaking
+                if is_speaking and speech_text and self._check_for_interrupt_word(speech_text):
+                    logger.info(f"Interrupt word detected in offline mode: {speech_text}")
+                    is_interrupted = True
+                
+                return speech_text
             else:
                 # Use online recognition
                 if source is None:
@@ -470,6 +516,11 @@ class SpeechRecognizer:
                 effective_timeout = timeout if timeout is not None else self.listen_timeout
                 logger.debug(f"Using timeout: {effective_timeout}s for online recognition")
                 
+                # If we're speaking, use a lower energy threshold to make it easier to detect speech
+                if is_speaking:
+                    original_energy = self.recognizer.energy_threshold
+                    self.recognizer.energy_threshold = max(original_energy * 0.8, 200)
+                
                 # Listen for audio with phrase timeout
                 logger.debug(f"Listening for speech with parameters: pause_threshold={self.pause_threshold}s, phrase_time_limit={self.phrase_time_limit}s")
                 audio = self.recognizer.listen(
@@ -478,6 +529,10 @@ class SpeechRecognizer:
                     phrase_time_limit=self.phrase_time_limit,  # Use configured phrase time limit
                     snowboy_configuration=None
                 )
+                
+                # Restore original energy threshold if we modified it
+                if is_speaking:
+                    self.recognizer.energy_threshold = original_energy
                 
                 # Recognize speech
                 try:
@@ -493,6 +548,11 @@ class SpeechRecognizer:
                     
                     # Print and log what was heard
                     print_heard_message(text)
+                    
+                    # Check for interrupt word if we're speaking
+                    if is_speaking and self._check_for_interrupt_word(text):
+                        logger.info(f"Interrupt word detected: {text}")
+                        is_interrupted = True
                     
                     return text
                 except sr.UnknownValueError:
