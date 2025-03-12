@@ -424,7 +424,7 @@ class ConversationalAssistant:
             print("\nListening for commands... Say 'Hey Maxwell' to activate me.")
             print(f"You can interrupt me by saying '{interrupt_word}' while I'm speaking.")
             print(f"You can execute commands by saying '{command_prefix} [command]'.")
-            print(f"Available commands: {', '.join(self.available_commands.keys())}")
+            print(f"Available commands: {', '.join(available_commands.keys())}")
             print("Say 'end conversation' to exit conversation mode.\n")
             
             # Track time of last user input and speaking
