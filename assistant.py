@@ -8,6 +8,7 @@ Features:
 - Integration with Ollama for LLM responses
 - Conversation mode that stays active until explicitly ended
 - Command execution with web search capabilities
+- Non-blocking speech recognition that works while speaking
 
 Usage:
 - Say "Hey Maxwell" (or just "Maxwell") to activate
@@ -22,6 +23,7 @@ import sys
 import time
 import threading
 import argparse
+import logging
 
 # Import from our modules
 from utils import (
@@ -32,12 +34,13 @@ from utils import (
     command_prefix, is_interrupted, available_commands,
     setup_signal_handlers, print_assistant_response,
     print_user_input, is_wake_word, is_end_conversation, is_command,
-    extract_command
+    extract_command, is_interrupt_command
 )
 from tools import WebBrowser
 from ollama_client import OllamaClient, OLLAMA_CLIENT_AVAILABLE
 from tts import KokoroTTS
 from speech import SpeechRecognizer, VoskSpeechRecognizer, VOSK_AVAILABLE
+from concurrent_speech import ConcurrentSpeechRecognizer
 from commands import CommandExecutor
 
 class ConversationalAssistant:
@@ -70,8 +73,14 @@ class ConversationalAssistant:
         
         # Initialize speech recognition only if not skipping
         self.skip_speech = skip_speech
+        
+        # Always enable listen while speaking with the new implementation
+        global listen_while_speaking
+        listen_while_speaking = True
+        
         if not skip_speech:
-            self.recognizer = SpeechRecognizer(
+            # Initialize the concurrent speech recognizer
+            self.recognizer = ConcurrentSpeechRecognizer(
                 vad_aggressiveness=vad_aggressiveness,
                 language=language,
                 use_offline=use_offline_recognition,
@@ -125,9 +134,8 @@ class ConversationalAssistant:
         # Conversation mode flag
         self.conversation_mode = False
         
-        # Set global flag for listening while speaking
-        global listen_while_speaking
-        listen_while_speaking = enable_listen_while_speaking
+        # Processing flag to prevent multiple simultaneous processing
+        self.is_processing = False
         
         logger.info(f"Conversational assistant initialized{' with wake word: ' + wake_word if use_wake_word else ''}")
         logger.info(f"Interrupt word set to '{interrupt_word}'")
@@ -138,7 +146,22 @@ class ConversationalAssistant:
     
     def _handle_speech_interrupted(self):
         """Handle speech interruption."""
+        global is_interrupted, is_speaking, last_speaking_time, waiting_for_user_input, pending_user_input
+        
         logger.info("Handling speech interruption")
+        
+        # Reset the interrupted flag immediately
+        is_interrupted = False
+        
+        # Ensure speaking flag is reset immediately
+        is_speaking = False
+        last_speaking_time = time.time()
+        waiting_for_user_input = True
+        
+        # Clear any pending input that might be an interrupt command
+        if pending_user_input and is_interrupt_command(pending_user_input):
+            logger.info(f"Clearing pending interrupt command: {pending_user_input}")
+            pending_user_input = None
         
         # Acknowledge the interruption
         response_text = "I'll stop talking now."
@@ -148,22 +171,31 @@ class ConversationalAssistant:
         print_assistant_response(response_text)
         
         # We don't speak the response to avoid a loop of interruptions
+        # But we do need to ensure all flags are properly reset
+        self.is_processing = False  # Ensure processing flag is reset
+        logger.info("Speech interruption handled successfully")
     
     def _process_pending_input(self):
         """Process pending user input after speech is finished."""
-        global pending_user_input
+        global pending_user_input, is_interrupted, is_speaking, last_speaking_time, waiting_for_user_input
         
-        if pending_user_input:
-            logger.info(f"Processing pending input: {pending_user_input}")
+        # Make a local copy of pending_user_input and clear the global immediately
+        # to avoid race conditions
+        local_pending_input = pending_user_input
+        pending_user_input = None
+        
+        if local_pending_input:
+            logger.info(f"Processing pending input: {local_pending_input}")
             
-            # Store the input and clear the pending input
-            input_to_process = pending_user_input
-            pending_user_input = None
+            # Don't process if it's an interrupt command (no longer relevant)
+            if is_interrupt_command(local_pending_input):
+                logger.info(f"Skipping processing of interrupt command after speech: {local_pending_input}")
+                return
             
             # Process the input in a separate thread
             processing_thread = threading.Thread(
                 target=self.process_speech_to_response,
-                args=(input_to_process,)
+                args=(local_pending_input,)
             )
             processing_thread.daemon = True
             processing_thread.start()
@@ -174,167 +206,199 @@ class ConversationalAssistant:
         Args:
             speech_text: Recognized speech text
         """
-        global waiting_for_user_input, wake_word, wake_word_active, interrupt_word, is_interrupted, command_prefix
+        global waiting_for_user_input, wake_word, wake_word_active, interrupt_word, is_interrupted, command_prefix, is_speaking, last_speaking_time, pending_user_input
         
-        if not speech_text:
-            waiting_for_user_input = True  # Reset to waiting for input if no speech
-            return
-        
-        # Print and log the captured input in a clearly visible way
-        print_user_input(speech_text)
-        
-        # Check for interrupt word
-        speech_lower = speech_text.lower()
-        if is_speaking and (interrupt_word in speech_lower or "stop" in speech_lower or "shut up" in speech_lower):
-            logger.info(f"Interrupt word detected: {speech_lower}")
+        # Check for interrupt command first, before any other processing
+        if speech_text and is_interrupt_command(speech_text):
+            logger.info(f"Interrupt command detected: {speech_text}")
+            # Set the interrupted flag
             is_interrupted = True
+            
+            # IMMEDIATELY stop speaking - this is critical for responsiveness
+            if not self.skip_tts and self.tts is not None and is_speaking:
+                try:
+                    # Force stop any ongoing speech
+                    logger.info("Forcefully stopping speech due to interrupt command")
+                    self.tts.stop_speaking()
+                except Exception as e:
+                    logger.error(f"Error stopping speech: {e}")
+                    
+                    # Even if there's an error, ensure flags are reset
+                    is_speaking = False
+                    last_speaking_time = time.time()
+                    waiting_for_user_input = True
             return
         
-        # Check for command execution
-        if is_command(speech_text):
-            # Extract the command and arguments
-            command_name, command_args = extract_command(speech_text)
-            
-            # Execute the command
-            response_text = self.command_executor.execute_command(command_name, command_args)
-            
-            # Print and log the response
-            print_assistant_response(response_text)
-            
-            # Speak the response
-            waiting_for_user_input = False  # Not waiting for input while speaking
-            if not self.skip_tts and self.tts is not None:
-                self.tts.speak(response_text)
-            
-            # After speaking, we're waiting for user input again
-            waiting_for_user_input = True
+        # For non-interrupt commands, check if we're already processing
+        if self.is_processing:
+            logger.info("Already processing speech, ignoring new input")
             return
+            
+        # Set the processing flag for non-interrupt commands
+        self.is_processing = True
         
-        # Check for wake word if wake word is enabled and not already active
-        if self.use_wake_word:
-            # If wake word is not active, check if the input contains the wake word or similar
-            if not wake_word_active and not self.conversation_mode:
-                if is_wake_word(speech_text):
-                    # Wake word detected
-                    wake_word_active = True
-                    self.conversation_mode = True
-                    logger.info(f"Wake word detected: {speech_text}")
-                    
-                    # Remove wake word from text
-                    wake_word_parts = wake_word.lower().split()
-                    main_name = wake_word_parts[-1] if len(wake_word_parts) > 0 else wake_word
-                    
-                    for phrase in [wake_word, main_name, f"hi {main_name}", f"hello {main_name}", 
-                                  f"ok {main_name}", f"okay {main_name}", f"hey {main_name}", 
-                                  f"{main_name} please"]:
-                        speech_text = speech_text.lower().replace(phrase, "").strip()
-                    
-                    if not speech_text:
-                        # Just acknowledge if no command after wake word
-                        response_text = f"Yes, {main_name.capitalize()} here. How can I help you?"
-                        logger.info(f"Speaking wake word acknowledgement: {response_text}")
-                        
-                        # Print and log the response
-                        print_assistant_response(response_text)
-                        
-                        # Speak the response
-                        waiting_for_user_input = False  # Not waiting for input while speaking
-                        if not self.skip_tts and self.tts is not None:
-                            self.tts.speak(response_text)
-                        
-                        # After speaking, we're waiting for user input again
-                        waiting_for_user_input = True
-                        return
-                else:
-                    # No wake word, ignore input
-                    logger.info(f"Ignoring input without wake word: {speech_text}")
-                    return
-        
-        # Check for end conversation
-        if is_end_conversation(speech_text):
-            # End conversation mode
-            self.conversation_mode = False
-            wake_word_active = False
-            
-            # Acknowledge end of conversation
-            response_text = "Goodbye! Let me know if you need anything else."
-            logger.info(f"Speaking end conversation acknowledgement: {response_text}")
-            
-            # Print and log the response
-            print_assistant_response(response_text)
-            
-            # Speak the response
-            waiting_for_user_input = False  # Not waiting for input while speaking
-            if not self.skip_tts and self.tts is not None:
-                self.tts.speak(response_text)
-            
-            # After speaking, we're waiting for user input again
-            waiting_for_user_input = True
-            return
-        
-        # Process with Ollama
         try:
-            # Add to conversation history
-            self.conversation_history.append({"role": "user", "content": speech_text})
+            if not speech_text:
+                waiting_for_user_input = True  # Reset to waiting for input if no speech
+                return
             
-            # Generate response
-            logger.info("Generating response with Ollama...")
+            # Print and log the captured input in a clearly visible way
+            print_user_input(speech_text)
             
-            # Prepare messages for the model
-            messages = [{"role": "system", "content": self.system_prompt}]
-            messages.extend(self.conversation_history[-10:])  # Include last 10 messages
-            
-            # Convert messages to prompt format
-            prompt = ""
-            for message in messages:
-                role = message["role"]
-                content = message["content"]
+            # Check for command execution
+            if is_command(speech_text):
+                # Extract the command and arguments
+                command_name, command_args = extract_command(speech_text)
                 
-                if role == "system":
-                    prompt += f"<|system|>\n{content}\n"
-                elif role == "user":
-                    prompt += f"<|user|>\n{content}\n"
-                elif role == "assistant":
-                    prompt += f"<|assistant|>\n{content}\n"
+                # Execute the command
+                response_text = self.command_executor.execute_command(command_name, command_args)
+                
+                # Print and log the response
+                print_assistant_response(response_text)
+                
+                # Speak the response
+                waiting_for_user_input = False  # Not waiting for input while speaking
+                if not self.skip_tts and self.tts is not None:
+                    self.tts.speak(response_text)
+                
+                # After speaking, we're waiting for user input again
+                waiting_for_user_input = True
+                return
             
-            # Add final assistant prompt
-            prompt += "<|assistant|>\n"
+            # Check for wake word if wake word is enabled and not already active
+            if self.use_wake_word:
+                # If wake word is not active, check if the input contains the wake word or similar
+                if not wake_word_active and not self.conversation_mode:
+                    if is_wake_word(speech_text):
+                        # Wake word detected
+                        wake_word_active = True
+                        self.conversation_mode = True
+                        logger.info(f"Wake word detected: {speech_text}")
+                        
+                        # Remove wake word from text
+                        wake_word_parts = wake_word.lower().split()
+                        main_name = wake_word_parts[-1] if len(wake_word_parts) > 0 else wake_word
+                        
+                        for phrase in [wake_word, main_name, f"hi {main_name}", f"hello {main_name}", 
+                                      f"ok {main_name}", f"okay {main_name}", f"hey {main_name}", 
+                                      f"{main_name} please"]:
+                            speech_text = speech_text.lower().replace(phrase, "").strip()
+                        
+                        if not speech_text:
+                            # Just acknowledge if no command after wake word
+                            response_text = f"Yes, {main_name.capitalize()} here. How can I help you?"
+                            logger.info(f"Speaking wake word acknowledgement: {response_text}")
+                            
+                            # Print and log the response
+                            print_assistant_response(response_text)
+                            
+                            # Speak the response
+                            waiting_for_user_input = False  # Not waiting for input while speaking
+                            if not self.skip_tts and self.tts is not None:
+                                self.tts.speak(response_text)
+                            
+                            # After speaking, we're waiting for user input again
+                            waiting_for_user_input = True
+                            return
+                    else:
+                        # No wake word, ignore input
+                        logger.info(f"Ignoring input without wake word: {speech_text}")
+                        return
             
-            # Generate response
-            response = self.ollama.generate(prompt, system_prompt=self.system_prompt)
+            # Check for end conversation
+            if is_end_conversation(speech_text):
+                # End conversation mode
+                self.conversation_mode = False
+                wake_word_active = False
+                
+                # Acknowledge end of conversation
+                response_text = "Goodbye! Let me know if you need anything else."
+                logger.info(f"Speaking end conversation acknowledgement: {response_text}")
+                
+                # Print and log the response
+                print_assistant_response(response_text)
+                
+                # Speak the response
+                waiting_for_user_input = False  # Not waiting for input while speaking
+                if not self.skip_tts and self.tts is not None:
+                    self.tts.speak(response_text)
+                
+                # After speaking, we're waiting for user input again
+                waiting_for_user_input = True
+                return
             
-            # Clean up response
-            response_text = response.strip()
-            
-            # Add to conversation history
-            self.conversation_history.append({"role": "assistant", "content": response_text})
-            
-            # Print and log the response
-            print_assistant_response(response_text)
-            
-            # Speak the response
-            waiting_for_user_input = False  # Not waiting for input while speaking
-            if not self.skip_tts and self.tts is not None:
-                self.tts.speak(response_text)
-            
-            # After speaking, we're waiting for user input again
-            waiting_for_user_input = True
+            # Process with Ollama
+            try:
+                # Add to conversation history
+                self.conversation_history.append({"role": "user", "content": speech_text})
+                
+                # Generate response
+                logger.info("Generating response with Ollama...")
+                
+                # Prepare messages for the model
+                messages = [{"role": "system", "content": self.system_prompt}]
+                messages.extend(self.conversation_history[-10:])  # Include last 10 messages
+                
+                # Convert messages to prompt format
+                prompt = ""
+                for message in messages:
+                    role = message["role"]
+                    content = message["content"]
+                    
+                    if role == "system":
+                        prompt += f"<|system|>\n{content}\n"
+                    elif role == "user":
+                        prompt += f"<|user|>\n{content}\n"
+                    elif role == "assistant":
+                        prompt += f"<|assistant|>\n{content}\n"
+                
+                # Add final assistant prompt
+                prompt += "<|assistant|>\n"
+                
+                # Generate response
+                response = self.ollama.generate(prompt, system_prompt=self.system_prompt)
+                
+                # Clean up response
+                response_text = response.strip()
+                
+                # Add to conversation history
+                self.conversation_history.append({"role": "assistant", "content": response_text})
+                
+                # Print and log the response
+                print_assistant_response(response_text)
+                
+                # Speak the response
+                waiting_for_user_input = False  # Not waiting for input while speaking
+                if not self.skip_tts and self.tts is not None:
+                    self.tts.speak(response_text)
+                
+                # After speaking, we're waiting for user input again
+                waiting_for_user_input = True
+            except Exception as e:
+                logger.error(f"Error generating response: {e}")
+                
+                # Speak error message
+                error_message = "I'm sorry, I encountered an error while processing your request. Please try again."
+                logger.info(f"Speaking error message: {error_message}")
+                
+                # Print and log the error message
+                print_assistant_response(error_message)
+                
+                # Speak the error message
+                waiting_for_user_input = False  # Not waiting for input while speaking
+                if not self.skip_tts and self.tts is not None:
+                    self.tts.speak(error_message)
+                
+                # After speaking, we're waiting for user input again
+                waiting_for_user_input = True
         except Exception as e:
-            logger.error(f"Error generating response: {e}")
-            
-            # Speak error message
-            error_message = "I'm sorry, I encountered an error while processing your request. Please try again."
-            logger.info(f"Speaking error message: {error_message}")
-            
-            # Print and log the error message
-            print_assistant_response(error_message)
-            
-            # Speak the error message
-            waiting_for_user_input = False  # Not waiting for input while speaking
-            if not self.skip_tts and self.tts is not None:
-                self.tts.speak(error_message)
-            
-            # After speaking, we're waiting for user input again
+            logger.error(f"Error processing speech: {e}")
+            # Ensure we reset waiting_for_user_input even if there's an error
+            waiting_for_user_input = True
+        finally:
+            # Reset processing flag
+            self.is_processing = False
+            # Ensure we're waiting for user input
             waiting_for_user_input = True
     
     def run(self, text_input=None):
@@ -343,7 +407,8 @@ class ConversationalAssistant:
         Args:
             text_input: Optional text input to process (for testing)
         """
-        global stop_listening, waiting_for_user_input, max_silence_before_prompt, wake_word_active, pending_user_input, is_interrupted
+        global stop_listening, waiting_for_user_input, max_silence_before_prompt, wake_word_active
+        global pending_user_input, is_interrupted, is_speaking, last_speaking_time
         
         # Initial greeting
         greeting = "Hello! I'm Maxwell, your voice assistant. Say 'Hey Maxwell' to activate me."
@@ -404,22 +469,12 @@ class ConversationalAssistant:
             self.process_speech_to_response(text_input)
             return
         
-        # Initialize microphone if not skipping speech
+        # Initialize and start the concurrent speech recognizer if not skipping speech
         if not self.skip_speech and self.recognizer is not None:
-            # Initialize microphone
-            mic = None
-            if not self.recognizer.use_offline:
-                import speech_recognition as sr
-                mic = sr.Microphone()
-                
-                # Adjust for ambient noise
-                logger.info("Adjusting for ambient noise...")
-                with mic as source:
-                    self.recognizer.adjust_for_ambient_noise(source)
-            else:
-                logger.info("Using offline recognition, no ambient noise adjustment needed")
+            # Start the continuous listening thread
+            self.recognizer.start_listening()
             
-            # Main listening loop
+            # Main loop
             logger.info("Listening for commands...")
             print("\nListening for commands... Say 'Hey Maxwell' to activate me.")
             print(f"You can interrupt me by saying '{interrupt_word}' while I'm speaking.")
@@ -435,29 +490,49 @@ class ConversationalAssistant:
             waiting_for_user_input = True
             while not stop_listening:
                 try:
-                    # Listen for speech with the configured timeout
-                    speech_text = None
-                    if self.recognizer.use_offline:
-                        # Offline recognition doesn't need a source
-                        speech_text = self.recognizer.listen_for_speech(timeout=self.listen_timeout)
-                    else:
-                        # Online recognition needs a source
-                        with mic as source:
-                            speech_text = self.recognizer.listen_for_speech(source, timeout=self.listen_timeout)
+                    # Check for speech from the queue (non-blocking)
+                    speech_text = self.recognizer.get_speech(block=False)
                     
                     if speech_text:
                         # Update the last input time
                         last_user_input_time = time.time()
                         
-                        # Check for interrupt word while speaking
-                        speech_lower = speech_text.lower()
-                        if is_speaking and (interrupt_word in speech_lower or "stop" in speech_lower or "shut up" in speech_lower):
-                            logger.info(f"Interrupt word detected: {speech_lower}")
+                        # Check for interrupt command while speaking
+                        if is_speaking and is_interrupt_command(speech_text):
+                            logger.info(f"Interrupt command detected in main loop: {speech_text}")
+                            # Set the interrupted flag
                             is_interrupted = True
+                            
+                            # Print and log what was heard for the interrupt
+                            print_user_input(speech_text)
+                            
+                            # IMMEDIATELY stop speaking - this is critical for responsiveness
+                            if not self.skip_tts and self.tts is not None:
+                                try:
+                                    # Force stop any ongoing speech
+                                    logger.info("Forcefully stopping speech due to interrupt command")
+                                    self.tts.stop_speaking()
+                                except Exception as e:
+                                    logger.error(f"Error stopping speech: {e}")
+                                    
+                                    # Even if there's an error, ensure flags are reset
+                                    is_speaking = False
+                                    last_speaking_time = time.time()
+                                    waiting_for_user_input = True
+                                    
+                            # Acknowledge the interruption (without speaking)
+                            print_assistant_response("I'll stop talking now.")
+                            
+                            # Ensure flags are reset
+                            is_speaking = False
+                            last_speaking_time = time.time()
+                            waiting_for_user_input = True
+                            
+                            # Don't reset the interrupted flag here - let the callback handle it
                             continue  # Skip further processing of this input
                         
                         # If we're currently speaking, store the input to process after speaking
-                        if is_speaking:
+                        if is_speaking and not is_interrupt_command(speech_text):
                             logger.info(f"Received input while speaking, will process after current speech: {speech_text}")
                             pending_user_input = speech_text
                         else:
@@ -472,12 +547,6 @@ class ConversationalAssistant:
                             )
                             processing_thread.daemon = True
                             processing_thread.start()
-                            
-                            # Wait for processing to complete
-                            processing_thread.join()
-                            
-                            # After processing, we're waiting for user input again
-                            waiting_for_user_input = True
                     else:
                         # Check if we should prompt the user after a period of silence
                         current_time = time.time()
@@ -490,7 +559,8 @@ class ConversationalAssistant:
                             time_since_speaking > speaking_cooldown and 
                             self.conversation_mode and 
                             not is_speaking and 
-                            waiting_for_user_input):
+                            waiting_for_user_input and
+                            not self.is_processing):
                             
                             # Prompt the user
                             prompt_text = "Is there anything else you'd like help with?"
@@ -510,6 +580,10 @@ class ConversationalAssistant:
                 except KeyboardInterrupt:
                     logger.info("Keyboard interrupt detected")
                     break
+            
+            # Stop the speech recognizer
+            if self.recognizer is not None:
+                self.recognizer.stop()
         
         logger.info("Conversational assistant stopped")
 

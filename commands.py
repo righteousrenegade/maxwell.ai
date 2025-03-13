@@ -158,8 +158,29 @@ class CommandExecutor:
             return "Please specify what you'd like me to search for."
         
         try:
-            # Use the WebBrowser to perform the search
-            search_query = query.strip()
+            # Check if the query contains a limit parameter
+            limit = 5  # Default limit
+            query_parts = query.split()
+            
+            # Look for "limit X" or "limit=X" in the query
+            for i, part in enumerate(query_parts):
+                if part.lower() == "limit" and i < len(query_parts) - 1 and query_parts[i+1].isdigit():
+                    limit = int(query_parts[i+1])
+                    # Remove the limit parameter from the query
+                    query_parts.pop(i+1)
+                    query_parts.pop(i)
+                    break
+                elif part.lower().startswith("limit=") and part[6:].isdigit():
+                    limit = int(part[6:])
+                    # Remove the limit parameter from the query
+                    query_parts.pop(i)
+                    break
+            
+            # Ensure limit is reasonable
+            limit = max(1, min(limit, 10))  # Between 1 and 10
+            
+            # Reconstruct the query without the limit parameter
+            search_query = " ".join(query_parts).strip()
             self.last_search_query = search_query
             
             # Print the search steps with small delays to simulate the process
@@ -191,9 +212,10 @@ class CommandExecutor:
                 return f"I couldn't find any relevant results for '{search_query}'."
             
             # Format the response
-            response = f"Here are the search results for '{search_query}':\n\n"
+            response = f"Here are the search results for '{search_query}' (showing {min(limit, len(results))} of {len(results)} results):\n\n"
             
-            for i, result in enumerate(results, 1):
+            # Limit the number of results shown
+            for i, result in enumerate(results[:limit], 1):
                 title = result.get('title', 'Untitled')
                 url = result.get('url', '')
                 snippet = result.get('snippet', '')

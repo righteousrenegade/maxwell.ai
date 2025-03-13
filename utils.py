@@ -236,4 +236,48 @@ def extract_command(text):
     command_name = command_parts[0].strip()
     command_args = command_parts[1].strip() if len(command_parts) > 1 else None
     
-    return command_name, command_args 
+    return command_name, command_args
+
+def is_interrupt_command(text):
+    """Check if the text contains an interrupt command.
+    
+    Args:
+        text: Text to check
+        
+    Returns:
+        True if the text contains an interrupt command, False otherwise
+    """
+    if not text:
+        return False
+        
+    text_lower = text.lower().strip()
+    
+    # First check for exact matches of the most common interrupt phrases
+    # for maximum responsiveness
+    if (text_lower == "stop" or 
+        text_lower == interrupt_word or 
+        text_lower == "shut up" or 
+        text_lower == "be quiet" or
+        text_lower == "quiet" or
+        text_lower == "silence"):
+        return True
+    
+    # Then check for the phrases contained within the text
+    priority_phrases = ["stop", interrupt_word, "shut up", "be quiet", "silence", "quiet"]
+    for phrase in priority_phrases:
+        if phrase in text_lower:
+            return True
+    
+    # Then check for other interrupt phrases
+    other_phrases = [
+        "enough",
+        "pause",
+        "hold on"
+    ]
+    
+    # Check for matches in other phrases
+    for phrase in other_phrases:
+        if phrase in text_lower:
+            return True
+            
+    return False 

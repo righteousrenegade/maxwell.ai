@@ -209,7 +209,7 @@ class KokoroTTS:
         except Exception as e:
             print(f"Error listing languages: {e}")
     
-    def _chunk_text(self, text, max_chunk_length=150):
+    def _chunk_text(self, text, max_chunk_length=200):
         """Split text into chunks for better TTS handling.
         
         Args:
@@ -223,16 +223,71 @@ class KokoroTTS:
         if len(text) <= max_chunk_length:
             return [text]
             
-        # Split by sentences
+        # Split by sentences with more careful handling
         import re
-        sentences = re.split(r'(?<=[.!?])\s+', text)
+        
+        # Define sentence-ending patterns
+        sentence_end_pattern = r'(?<=[.!?])\s+'
+        
+        # Split text into sentences
+        sentences = re.split(sentence_end_pattern, text)
+        
+        # Make sure sentence endings are preserved
+        for i in range(len(sentences) - 1):
+            # Find the ending punctuation from the original text
+            if i < len(text):
+                end_match = re.search(r'[.!?]', text[text.find(sentences[i]) + len(sentences[i]):])
+                if end_match:
+                    sentences[i] += end_match.group(0)
+        
+        # Ensure the last sentence has proper ending
+        if sentences and not sentences[-1].rstrip().endswith(('.', '!', '?')):
+            sentences[-1] = sentences[-1].rstrip() + '.'
         
         chunks = []
         current_chunk = ""
         
         for sentence in sentences:
+            # Skip empty sentences
+            if not sentence.strip():
+                continue
+                
+            # If this sentence alone is longer than max_chunk_length, split it further
+            if len(sentence) > max_chunk_length:
+                # If we have accumulated text in current_chunk, add it first
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                    current_chunk = ""
+                
+                # Split long sentence by phrases (commas, semicolons, etc.)
+                phrase_pattern = r'(?<=[,;:])\s+'
+                phrases = re.split(phrase_pattern, sentence)
+                
+                # Ensure phrase endings are preserved
+                for i in range(len(phrases) - 1):
+                    if i < len(sentence):
+                        end_match = re.search(r'[,;:]', sentence[sentence.find(phrases[i]) + len(phrases[i]):])
+                        if end_match:
+                            phrases[i] += end_match.group(0)
+                
+                phrase_chunk = ""
+                for phrase in phrases:
+                    if len(phrase_chunk) + len(phrase) + 1 <= max_chunk_length:
+                        if phrase_chunk:
+                            phrase_chunk += " " + phrase
+                        else:
+                            phrase_chunk = phrase
+                    else:
+                        if phrase_chunk:
+                            chunks.append(phrase_chunk.strip())
+                        phrase_chunk = phrase
+                
+                if phrase_chunk:
+                    chunks.append(phrase_chunk.strip())
+                continue
+            
             # If adding this sentence would make the chunk too long, start a new chunk
-            if len(current_chunk) + len(sentence) > max_chunk_length and current_chunk:
+            if len(current_chunk) + len(sentence) + 1 > max_chunk_length and current_chunk:
                 chunks.append(current_chunk.strip())
                 current_chunk = sentence
             else:
@@ -246,27 +301,126 @@ class KokoroTTS:
         if current_chunk:
             chunks.append(current_chunk.strip())
             
-        return chunks
+        # Ensure no empty chunks
+        chunks = [chunk for chunk in chunks if chunk.strip()]
+        
+        # If we have only one chunk, return it
+        if len(chunks) == 1:
+            return chunks
+            
+        # For multiple chunks, ensure they're not too small (combine small chunks)
+        min_chunk_length = 50  # Minimum chunk length to avoid too many small chunks
+        combined_chunks = []
+        current_combined = ""
+        
+        for chunk in chunks:
+            if len(current_combined) + len(chunk) + 1 <= max_chunk_length:
+                if current_combined:
+                    current_combined += " " + chunk
+                else:
+                    current_combined = chunk
+            else:
+                if current_combined:
+                    combined_chunks.append(current_combined)
+                current_combined = chunk
+        
+        if current_combined:
+            combined_chunks.append(current_combined)
+        
+        return combined_chunks
     
-    def _check_for_interrupt(self, stream, interval=0.05):
+    def _prepare_all_audio(self, chunks):
+        """Prepare audio for all chunks before playback.
+        
+        Args:
+            chunks: List of text chunks
+            
+        Returns:
+            Tuple of (concatenated_samples, sample_rate)
+        """
+        all_samples = []
+        sample_rate = 16000  # Default sample rate
+        
+        for chunk in chunks:
+            try:
+                # Try to create audio with the specified parameters
+                samples, chunk_sample_rate = self.kokoro.create(
+                    chunk, 
+                    voice=self.voice, 
+                    speed=self.speed, 
+                    lang=self.language
+                )
+                all_samples.append(samples)
+                sample_rate = chunk_sample_rate  # Update sample rate (should be consistent)
+            except TypeError as e:
+                # If we get a TypeError, it might be because the create method has different parameters
+                logger.warning(f"Error with TTS parameters: {e}. Trying with default parameters.")
+                try:
+                    # Try with just the text
+                    samples, chunk_sample_rate = self.kokoro.create(chunk)
+                    all_samples.append(samples)
+                    sample_rate = chunk_sample_rate  # Update sample rate
+                except Exception as e2:
+                    logger.error(f"Error in text-to-speech with default parameters: {e2}")
+                    # Add a short silence to maintain flow
+                    all_samples.append(np.zeros(500, dtype=np.float32))
+            except Exception as e:
+                logger.error(f"Error creating audio for chunk: {e}")
+                # Add a short silence to maintain flow
+                all_samples.append(np.zeros(500, dtype=np.float32))
+        
+        # Concatenate all samples with a tiny silence between chunks for natural pauses
+        if not all_samples:
+            return np.zeros(1000, dtype=np.float32), sample_rate
+            
+        # Add a very small silence between chunks (10ms) for more natural speech
+        silence = np.zeros(int(sample_rate * 0.01), dtype=np.float32)
+        concatenated_samples = all_samples[0]
+        
+        for samples in all_samples[1:]:
+            concatenated_samples = np.concatenate((concatenated_samples, silence, samples))
+        
+        return concatenated_samples, sample_rate
+    
+    def _check_for_interrupt(self, stream, interval=0.002):
         """Check for interrupt flag at regular intervals.
         
         Args:
             stream: Audio stream to stop if interrupted
-            interval: Check interval in seconds
+            interval: Check interval in seconds (2ms for ultra-responsive interruption)
         """
-        global is_interrupted
+        global is_interrupted, is_speaking, last_speaking_time, waiting_for_user_input, pending_user_input
         
+        # Check very frequently for better responsiveness
         while stream.active and not is_interrupted:
-            time.sleep(interval)  # Check more frequently for better responsiveness
+            time.sleep(interval)
             
-        if is_interrupted and stream.active:
-            logger.info("Interrupt detected, stopping audio stream")
-            stream.stop()
-            
-            # Call the speech interrupted callback if set
-            if self.on_speech_interrupted:
-                self.on_speech_interrupted()
+        # If interrupted, stop immediately
+        if is_interrupted:
+            logger.info("Interrupt detected, stopping audio stream IMMEDIATELY")
+            try:
+                # Stop the stream immediately if it's still active
+                if stream.active:
+                    stream.stop()
+                    logger.info("Audio stream stopped due to interrupt")
+                
+                # Reset speaking flags immediately
+                is_speaking = False
+                last_speaking_time = time.time()
+                waiting_for_user_input = True
+                
+                # Clear any pending input that might be an interrupt command
+                if pending_user_input and is_interrupt_command(pending_user_input):
+                    logger.info(f"Clearing pending interrupt command: {pending_user_input}")
+                    pending_user_input = None
+                
+                # Call the speech interrupted callback if set
+                if self.on_speech_interrupted:
+                    self.on_speech_interrupted()
+            except Exception as e:
+                logger.error(f"Error stopping audio stream: {e}")
+                
+            # Do not reset the interrupted flag here - let the callback handle it
     
     def _wait_for_stream(self, stream, samples, sample_rate, interval=0.05):
         """Wait for the audio stream to finish playing.
@@ -313,108 +467,59 @@ class KokoroTTS:
         is_interrupted = False  # Reset interrupted flag
         
         try:
-            # Process text in chunks for better handling
+            # Process text into chunks for better handling
             chunks = self._chunk_text(text)
+            logger.debug(f"Split text into {len(chunks)} chunks")
             
-            for chunk in chunks:
-                # Check if we should stop speaking
-                if is_interrupted:
-                    logger.info("Speech interrupted before chunk processing")
-                    break
+            # Prepare all audio data as a single continuous stream
+            samples, sample_rate = self._prepare_all_audio(chunks)
+            
+            # Check if we should stop speaking
+            if is_interrupted:
+                logger.info("Speech interrupted before playback")
+                is_speaking = False  # Ensure flag is reset
+                last_speaking_time = time.time()
+                waiting_for_user_input = True
+                return
+            
+            try:
+                # Start a single audio stream for the entire text
+                stream = sd.OutputStream(
+                    samplerate=sample_rate,
+                    channels=1,
+                    callback=None,
+                    finished_callback=None
+                )
+                stream.start()
+                self.current_stream = stream
                 
-                logger.debug(f"Speaking chunk: {chunk[:50]}...")
-                try:
-                    # Try to create audio with the specified parameters
-                    samples, sample_rate = self.kokoro.create(
-                        chunk, 
-                        voice=self.voice, 
-                        speed=self.speed, 
-                        lang=self.language
-                    )
+                # Start a separate thread to check for interrupts BEFORE writing samples
+                interrupt_thread = threading.Thread(
+                    target=self._check_for_interrupt,
+                    args=(stream, 0.002)  # Check every 2ms for better responsiveness
+                )
+                interrupt_thread.daemon = True
+                interrupt_thread.start()
+                
+                # Write all samples to the stream at once
+                if not is_interrupted:  # Check again before writing
+                    stream.write(samples)
+                
+                # Wait for the audio to finish or be interrupted
+                self._wait_for_stream(stream, samples, sample_rate, 0.05)
+                
+                # Check if we were interrupted
+                if is_interrupted:
+                    logger.info("Speech interrupted during playback")
+                    return
                     
-                    # Play the audio with a way to interrupt
-                    try:
-                        # Start the audio stream
-                        stream = sd.OutputStream(
-                            samplerate=sample_rate,
-                            channels=1,
-                            callback=None,
-                            finished_callback=None
-                        )
-                        stream.start()
-                        self.current_stream = stream
-                        
-                        # Write the samples to the stream
-                        stream.write(samples)
-                        
-                        # Start a separate thread to check for interrupts
-                        interrupt_thread = threading.Thread(
-                            target=self._check_for_interrupt,
-                            args=(stream, 0.05)  # Check every 50ms for better responsiveness
-                        )
-                        interrupt_thread.daemon = True
-                        interrupt_thread.start()
-                        
-                        # Wait for the audio to finish or be interrupted
-                        self._wait_for_stream(stream, samples, sample_rate, 0.05)
-                        
-                        # Check if we were interrupted
-                        if is_interrupted:
-                            logger.info("Speech interrupted during playback")
-                            break
-                            
-                    except KeyboardInterrupt:
-                        # Stop audio on keyboard interrupt
-                        logger.info("Speech interrupted by keyboard")
-                        if stream.active:
-                            stream.stop()
-                        break
-                except TypeError as e:
-                    # If we get a TypeError, it might be because the create method has different parameters
-                    logger.warning(f"Error with TTS parameters: {e}. Trying with default parameters.")
-                    try:
-                        # Try with just the text
-                        samples, sample_rate = self.kokoro.create(chunk)
-                        
-                        # Play the audio with a way to interrupt
-                        try:
-                            # Start the audio stream
-                            stream = sd.OutputStream(
-                                samplerate=sample_rate,
-                                channels=1,
-                                callback=None,
-                                finished_callback=None
-                            )
-                            stream.start()
-                            self.current_stream = stream
-                            
-                            # Write the samples to the stream
-                            stream.write(samples)
-                            
-                            # Start a separate thread to check for interrupts
-                            interrupt_thread = threading.Thread(
-                                target=self._check_for_interrupt,
-                                args=(stream, 0.05)  # Check every 50ms for better responsiveness
-                            )
-                            interrupt_thread.daemon = True
-                            interrupt_thread.start()
-                            
-                            # Wait for the audio to finish or be interrupted
-                            self._wait_for_stream(stream, samples, sample_rate, 0.05)
-                            
-                            # Check if we were interrupted
-                            if is_interrupted:
-                                logger.info("Speech interrupted during playback")
-                                break
-                                
-                        except KeyboardInterrupt:
-                            # Stop audio on keyboard interrupt
-                            logger.info("Speech interrupted by keyboard")
-                            if stream.active:
-                                stream.stop()
-                            break
-                    except Exception as e2:
-                        logger.error(f"Error in text-to-speech with default parameters: {e2}")
+            except KeyboardInterrupt:
+                # Stop audio on keyboard interrupt
+                logger.info("Speech interrupted by keyboard")
+                if stream and stream.active:
+                    stream.stop()
+            except Exception as e:
+                logger.error(f"Error playing audio: {e}")
         except Exception as e:
             logger.error(f"Error in text-to-speech: {e}")
         finally:
@@ -426,10 +531,16 @@ class KokoroTTS:
             
             # Call the speech finished callback if set
             if not is_interrupted and self.on_speech_finished:
-                self.on_speech_finished()
+                try:
+                    self.on_speech_finished()
+                except Exception as e:
+                    logger.error(f"Error in speech finished callback: {e}")
             elif is_interrupted and self.on_speech_interrupted:
                 # Ensure the interrupted callback is called if we were interrupted
-                self.on_speech_interrupted()
+                try:
+                    self.on_speech_interrupted()
+                except Exception as e:
+                    logger.error(f"Error in speech interrupted callback: {e}")
     
     def stream_speak(self, text_chunk):
         """Convert a chunk of text to speech and play it immediately.
@@ -461,113 +572,93 @@ class KokoroTTS:
                 return
             
             logger.debug(f"Speaking stream chunk: {text_chunk}")
+            
+            # Process text into smaller chunks if needed
+            chunks = self._chunk_text(text_chunk)
+            
+            # Prepare all audio data as a single continuous stream
+            samples, sample_rate = self._prepare_all_audio(chunks)
+            
+            # Check if we should stop speaking
+            if is_interrupted:
+                logger.info("Stream speech interrupted before playback")
+                return
+            
             try:
-                # Try to create audio with the specified parameters
-                samples, sample_rate = self.kokoro.create(
-                    text_chunk, 
-                    voice=self.voice, 
-                    speed=self.speed, 
-                    lang=self.language
+                # Start a single audio stream for the entire chunk
+                stream = sd.OutputStream(
+                    samplerate=sample_rate,
+                    channels=1,
+                    callback=None,
+                    finished_callback=None
                 )
+                stream.start()
+                self.current_stream = stream
                 
-                # Play the audio with a way to interrupt
-                try:
-                    # Start the audio stream
-                    stream = sd.OutputStream(
-                        samplerate=sample_rate,
-                        channels=1,
-                        callback=None,
-                        finished_callback=None
-                    )
-                    stream.start()
-                    self.current_stream = stream
-                    
-                    # Write the samples to the stream
-                    stream.write(samples)
-                    
-                    # Start a separate thread to check for interrupts
-                    interrupt_thread = threading.Thread(
-                        target=self._check_for_interrupt,
-                        args=(stream, 0.05)  # Check every 50ms for better responsiveness
-                    )
-                    interrupt_thread.daemon = True
-                    interrupt_thread.start()
-                    
-                    # Wait for the audio to finish or be interrupted
-                    self._wait_for_stream(stream, samples, sample_rate, 0.05)
-                    
-                    # Check if we were interrupted
-                    if is_interrupted:
-                        logger.info("Stream speech interrupted during playback")
-                        return
-                        
-                except KeyboardInterrupt:
-                    # Stop audio on keyboard interrupt
-                    logger.info("Stream speech interrupted by keyboard")
-                    if stream.active:
-                        stream.stop()
+                # Write all samples to the stream at once
+                stream.write(samples)
+                
+                # Start a separate thread to check for interrupts
+                interrupt_thread = threading.Thread(
+                    target=self._check_for_interrupt,
+                    args=(stream, 0.002)  # Check every 2ms for better responsiveness
+                )
+                interrupt_thread.daemon = True
+                interrupt_thread.start()
+                
+                # Wait for the audio to finish or be interrupted
+                self._wait_for_stream(stream, samples, sample_rate, 0.05)
+                
+                # Check if we were interrupted
+                if is_interrupted:
+                    logger.info("Stream speech interrupted during playback")
                     return
-            except TypeError as e:
-                # If we get a TypeError, it might be because the create method has different parameters
-                logger.warning(f"Error with TTS parameters: {e}. Trying with default parameters.")
-                try:
-                    # Try with just the text
-                    samples, sample_rate = self.kokoro.create(text_chunk)
                     
-                    # Play the audio with a way to interrupt
-                    try:
-                        # Start the audio stream
-                        stream = sd.OutputStream(
-                            samplerate=sample_rate,
-                            channels=1,
-                            callback=None,
-                            finished_callback=None
-                        )
-                        stream.start()
-                        self.current_stream = stream
-                        
-                        # Write the samples to the stream
-                        stream.write(samples)
-                        
-                        # Start a separate thread to check for interrupts
-                        interrupt_thread = threading.Thread(
-                            target=self._check_for_interrupt,
-                            args=(stream, 0.05)  # Check every 50ms for better responsiveness
-                        )
-                        interrupt_thread.daemon = True
-                        interrupt_thread.start()
-                        
-                        # Wait for the audio to finish or be interrupted
-                        self._wait_for_stream(stream, samples, sample_rate, 0.05)
-                        
-                        # Check if we were interrupted
-                        if is_interrupted:
-                            logger.info("Stream speech interrupted during playback")
-                            return
-                            
-                    except KeyboardInterrupt:
-                        # Stop audio on keyboard interrupt
-                        logger.info("Stream speech interrupted by keyboard")
-                        if stream.active:
-                            stream.stop()
-                        return
-                except Exception as e2:
-                    logger.error(f"Error in text-to-speech with default parameters: {e2}")
+            except KeyboardInterrupt:
+                # Stop audio on keyboard interrupt
+                logger.info("Stream speech interrupted by keyboard")
+                if stream.active:
+                    stream.stop()
+                return
+            except Exception as e:
+                logger.error(f"Error playing audio: {e}")
         except Exception as e:
             logger.error(f"Error in text-to-speech: {e}")
             
     def stop_speaking(self):
         """Stop speaking immediately."""
-        global is_speaking, is_interrupted
+        global is_speaking, is_interrupted, last_speaking_time, waiting_for_user_input, pending_user_input
         
-        if is_speaking:
-            logger.info("Stopping speech")
-            is_interrupted = True
-            
-            # Stop the current stream if it exists
-            if self.current_stream is not None and self.current_stream.active:
-                self.current_stream.stop()
-            
-            # Call the speech interrupted callback if set
-            if self.on_speech_interrupted:
-                self.on_speech_interrupted() 
+        logger.info("Stopping speech IMMEDIATELY")
+        # Set the interrupted flag first
+        is_interrupted = True
+        
+        # Stop the current stream if it exists - do this FIRST
+        if self.current_stream is not None:
+            try:
+                if self.current_stream.active:
+                    # Force stop the stream immediately
+                    self.current_stream.stop()
+                    self.current_stream = None  # Clear the reference
+                    logger.info("Audio stream forcefully stopped")
+            except Exception as e:
+                logger.error(f"Error stopping stream: {e}")
+        
+        # Reset speaking flag immediately
+        is_speaking = False
+        last_speaking_time = time.time()
+        waiting_for_user_input = True
+        
+        # Clear any pending input that might be an interrupt command
+        if pending_user_input and is_interrupt_command(pending_user_input):
+            logger.info(f"Clearing pending interrupt command: {pending_user_input}")
+            pending_user_input = None
+        
+        # Call the speech interrupted callback if set
+        if self.on_speech_interrupted:
+            try:
+                self.on_speech_interrupted()
+            except Exception as e:
+                logger.error(f"Error in speech interrupted callback: {e}")
+                
+        logger.info("Speech stopped successfully") 
