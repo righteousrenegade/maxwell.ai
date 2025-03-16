@@ -2,6 +2,11 @@
 
 A modular voice assistant powered by Ollama LLM and Kokoro TTS.
 
+## DEMO
+
+[![Watch the demo!](https://raw.githubusercontent.com/righteousrenegade/maxwell.ai/main/assets/maxwelldemo.mp4)](https://raw.githubusercontent.com/righteousrenegade/maxwell.ai/main/assets/maxwelldemo.mp4)
+
+
 ## Features
 
 - **Voice Recognition**: Recognizes speech with wake word detection
