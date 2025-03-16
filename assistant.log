@@ -1,0 +1,224 @@
+2025-03-15 21:25:34 - INFO - Command prefix set to 'execute'
+2025-03-15 21:25:34 - DEBUG - Debug logging enabled
+2025-03-15 21:25:34 - INFO - HTTP Request: GET http://127.0.0.1:11434/api/tags "HTTP/1.1 200 OK"
+2025-03-15 21:25:34 - WARNING - Model 'dolphin-llama3:8b-v2.9-q4_0' not found in available models: [None, None, None, None, None, None, None, None, None, None]
+2025-03-15 21:25:34 - INFO - Pulling model 'dolphin-llama3:8b-v2.9-q4_0'...
+2025-03-15 21:25:34 - INFO - HTTP Request: POST http://127.0.0.1:11434/api/pull "HTTP/1.1 200 OK"
+2025-03-15 21:25:34 - INFO - Model 'dolphin-llama3:8b-v2.9-q4_0' pulled successfully
+2025-03-15 21:25:34 - INFO - Connected to Ollama at http://localhost:11434 using Python client
+2025-03-15 21:25:34 - INFO - Initializing Kokoro TTS with model: kokoro-v1.0.onnx, voices: voices-v1.0.bin
+2025-03-15 21:25:35 - INFO - Using voice: bm_lewis, language: en-us, speed: 1.25
+2025-03-15 21:25:35 - INFO - Testing TTS...
+2025-03-15 21:25:35 - INFO - TTS test successful
+2025-03-15 21:25:35 - INFO - HTTP Request: GET http://127.0.0.1:11434/api/tags "HTTP/1.1 200 OK"
+2025-03-15 21:25:35 - WARNING - Model 'dolphin-llama3:8b-v2.9-q4_0' not found in available models: [None, None, None, None, None, None, None, None, None, None]
+2025-03-15 21:25:35 - INFO - Pulling model 'dolphin-llama3:8b-v2.9-q4_0'...
+2025-03-15 21:25:36 - INFO - HTTP Request: POST http://127.0.0.1:11434/api/pull "HTTP/1.1 200 OK"
+2025-03-15 21:25:36 - INFO - Model 'dolphin-llama3:8b-v2.9-q4_0' pulled successfully
+2025-03-15 21:25:36 - INFO - Connected to Ollama at http://localhost:11434 using Python client
+2025-03-15 21:25:36 - INFO - Speaking greeting: Hello! Maxwell here.
+2025-03-15 21:25:39 - INFO - Adjusting for ambient noise...
+2025-03-15 21:25:40 - INFO - Listening for speech...
+2025-03-15 21:26:18 - INFO - Command prefix set to 'execute'
+2025-03-15 21:26:18 - DEBUG - Debug logging enabled
+2025-03-15 21:26:18 - INFO - HTTP Request: GET http://127.0.0.1:11434/api/tags "HTTP/1.1 200 OK"
+2025-03-15 21:26:18 - WARNING - Model 'dolphin-llama3:8b-v2.9-q4_0' not found in available models: [None, None, None, None, None, None, None, None, None, None]
+2025-03-15 21:26:18 - INFO - Pulling model 'dolphin-llama3:8b-v2.9-q4_0'...
+2025-03-15 21:26:19 - INFO - HTTP Request: POST http://127.0.0.1:11434/api/pull "HTTP/1.1 200 OK"
+2025-03-15 21:26:19 - INFO - Model 'dolphin-llama3:8b-v2.9-q4_0' pulled successfully
+2025-03-15 21:26:19 - INFO - Connected to Ollama at http://localhost:11434 using Python client
+2025-03-15 21:26:19 - INFO - Initializing Kokoro TTS with model: kokoro-v1.0.onnx, voices: voices-v1.0.bin
+2025-03-15 21:26:19 - INFO - Using voice: bm_lewis, language: en-us, speed: 1.25
+2025-03-15 21:26:19 - INFO - Testing TTS...
+2025-03-15 21:26:20 - INFO - TTS test successful
+2025-03-15 21:26:20 - INFO - HTTP Request: GET http://127.0.0.1:11434/api/tags "HTTP/1.1 200 OK"
+2025-03-15 21:26:20 - WARNING - Model 'dolphin-llama3:8b-v2.9-q4_0' not found in available models: [None, None, None, None, None, None, None, None, None, None]
+2025-03-15 21:26:20 - INFO - Pulling model 'dolphin-llama3:8b-v2.9-q4_0'...
+2025-03-15 21:26:20 - INFO - HTTP Request: POST http://127.0.0.1:11434/api/pull "HTTP/1.1 200 OK"
+2025-03-15 21:26:20 - INFO - Model 'dolphin-llama3:8b-v2.9-q4_0' pulled successfully
+2025-03-15 21:26:20 - INFO - Connected to Ollama at http://localhost:11434 using Python client
+2025-03-15 21:26:20 - INFO - Speaking greeting: Hello! Maxwell here.
+2025-03-15 21:26:24 - INFO - Adjusting for ambient noise...
+2025-03-15 21:26:25 - INFO - Listening for speech...
+2025-03-15 21:27:33 - INFO - Command prefix set to 'execute'
+2025-03-15 21:27:33 - DEBUG - Debug logging enabled
+2025-03-15 21:27:33 - INFO - HTTP Request: GET http://127.0.0.1:11434/api/tags "HTTP/1.1 200 OK"
+2025-03-15 21:27:33 - WARNING - Model 'dolphin-llama3:8b-v2.9-q4_0' not found in available models: [None, None, None, None, None, None, None, None, None, None]
+2025-03-15 21:27:33 - INFO - Pulling model 'dolphin-llama3:8b-v2.9-q4_0'...
+2025-03-15 21:27:33 - INFO - HTTP Request: POST http://127.0.0.1:11434/api/pull "HTTP/1.1 200 OK"
+2025-03-15 21:27:33 - INFO - Model 'dolphin-llama3:8b-v2.9-q4_0' pulled successfully
+2025-03-15 21:27:33 - INFO - Connected to Ollama at http://localhost:11434 using Python client
+2025-03-15 21:27:33 - INFO - Initializing Kokoro TTS with model: kokoro-v1.0.onnx, voices: voices-v1.0.bin
+2025-03-15 21:27:34 - INFO - Using voice: bm_lewis, language: en-us, speed: 1.25
+2025-03-15 21:27:34 - INFO - Testing TTS...
+2025-03-15 21:27:35 - INFO - TTS test successful
+2025-03-15 21:27:35 - INFO - HTTP Request: GET http://127.0.0.1:11434/api/tags "HTTP/1.1 200 OK"
+2025-03-15 21:27:35 - WARNING - Model 'dolphin-llama3:8b-v2.9-q4_0' not found in available models: [None, None, None, None, None, None, None, None, None, None]
+2025-03-15 21:27:35 - INFO - Pulling model 'dolphin-llama3:8b-v2.9-q4_0'...
+2025-03-15 21:27:35 - INFO - HTTP Request: POST http://127.0.0.1:11434/api/pull "HTTP/1.1 200 OK"
+2025-03-15 21:27:35 - INFO - Model 'dolphin-llama3:8b-v2.9-q4_0' pulled successfully
+2025-03-15 21:27:35 - INFO - Connected to Ollama at http://localhost:11434 using Python client
+2025-03-15 21:27:35 - INFO - Signal handlers registered
+2025-03-15 21:27:35 - INFO - Speaking greeting: Hello! Maxwell here.
+2025-03-15 21:27:38 - INFO - Adjusting for ambient noise...
+2025-03-15 21:27:39 - INFO - Listening for speech...
+2025-03-15 21:27:42 - INFO - Interrupt signal received, stopping...
+2025-03-15 21:27:52 - INFO - Command prefix set to 'execute'
+2025-03-15 21:27:52 - DEBUG - Debug logging enabled
+2025-03-15 21:27:52 - INFO - HTTP Request: GET http://127.0.0.1:11434/api/tags "HTTP/1.1 200 OK"
+2025-03-15 21:27:52 - WARNING - Model 'dolphin-llama3:8b-v2.9-q4_0' not found in available models: [None, None, None, None, None, None, None, None, None, None]
+2025-03-15 21:27:52 - INFO - Pulling model 'dolphin-llama3:8b-v2.9-q4_0'...
+2025-03-15 21:27:52 - INFO - HTTP Request: POST http://127.0.0.1:11434/api/pull "HTTP/1.1 200 OK"
+2025-03-15 21:27:52 - INFO - Model 'dolphin-llama3:8b-v2.9-q4_0' pulled successfully
+2025-03-15 21:27:52 - INFO - Connected to Ollama at http://localhost:11434 using Python client
+2025-03-15 21:27:52 - INFO - Initializing Kokoro TTS with model: kokoro-v1.0.onnx, voices: voices-v1.0.bin
+2025-03-15 21:27:53 - INFO - Using voice: bm_lewis, language: en-us, speed: 1.25
+2025-03-15 21:27:53 - INFO - Testing TTS...
+2025-03-15 21:27:53 - INFO - TTS test successful
+2025-03-15 21:27:53 - INFO - HTTP Request: GET http://127.0.0.1:11434/api/tags "HTTP/1.1 200 OK"
+2025-03-15 21:27:53 - WARNING - Model 'dolphin-llama3:8b-v2.9-q4_0' not found in available models: [None, None, None, None, None, None, None, None, None, None]
+2025-03-15 21:27:53 - INFO - Pulling model 'dolphin-llama3:8b-v2.9-q4_0'...
+2025-03-15 21:27:54 - INFO - HTTP Request: POST http://127.0.0.1:11434/api/pull "HTTP/1.1 200 OK"
+2025-03-15 21:27:54 - INFO - Model 'dolphin-llama3:8b-v2.9-q4_0' pulled successfully
+2025-03-15 21:27:54 - INFO - Connected to Ollama at http://localhost:11434 using Python client
+2025-03-15 21:27:54 - INFO - Signal handlers registered
+2025-03-15 21:27:54 - INFO - Speaking greeting: Hello! Maxwell here.
+2025-03-15 21:27:57 - INFO - Adjusting for ambient noise...
+2025-03-15 21:27:58 - INFO - Listening for speech...
+2025-03-15 21:28:04 - INFO - Interrupt signal received, stopping...
+2025-03-15 21:31:10 - INFO - Command prefix set to 'execute'
+2025-03-15 21:31:10 - DEBUG - Debug logging enabled
+2025-03-15 21:31:10 - INFO - HTTP Request: GET http://127.0.0.1:11434/api/tags "HTTP/1.1 200 OK"
+2025-03-15 21:31:10 - WARNING - Model 'dolphin-llama3:8b-v2.9-q4_0' not found in available models: [None, None, None, None, None, None, None, None, None, None]
+2025-03-15 21:31:10 - INFO - Pulling model 'dolphin-llama3:8b-v2.9-q4_0'...
+2025-03-15 21:31:10 - INFO - HTTP Request: POST http://127.0.0.1:11434/api/pull "HTTP/1.1 200 OK"
+2025-03-15 21:31:10 - INFO - Model 'dolphin-llama3:8b-v2.9-q4_0' pulled successfully
+2025-03-15 21:31:10 - INFO - Connected to Ollama at http://localhost:11434 using Python client
+2025-03-15 21:31:10 - INFO - Initializing Kokoro TTS with model: kokoro-v1.0.onnx, voices: voices-v1.0.bin
+2025-03-15 21:31:11 - INFO - Using voice: bm_lewis, language: en-us, speed: 1.25
+2025-03-15 21:31:11 - INFO - Testing TTS...
+2025-03-15 21:31:12 - INFO - TTS test successful
+2025-03-15 21:31:12 - INFO - HTTP Request: GET http://127.0.0.1:11434/api/tags "HTTP/1.1 200 OK"
+2025-03-15 21:31:12 - WARNING - Model 'dolphin-llama3:8b-v2.9-q4_0' not found in available models: [None, None, None, None, None, None, None, None, None, None]
+2025-03-15 21:31:12 - INFO - Pulling model 'dolphin-llama3:8b-v2.9-q4_0'...
+2025-03-15 21:31:12 - INFO - HTTP Request: POST http://127.0.0.1:11434/api/pull "HTTP/1.1 200 OK"
+2025-03-15 21:31:12 - INFO - Model 'dolphin-llama3:8b-v2.9-q4_0' pulled successfully
+2025-03-15 21:31:12 - INFO - Connected to Ollama at http://localhost:11434 using Python client
+2025-03-15 21:31:12 - INFO - Signal handlers registered
+2025-03-15 21:31:12 - INFO - Speaking greeting: Hello! Maxwell here.
+2025-03-15 21:31:16 - INFO - Adjusting for ambient noise...
+2025-03-15 21:31:17 - INFO - Listening for speech...
+2025-03-15 21:31:30 - INFO - Interrupt signal received, stopping...
+2025-03-15 21:31:54 - INFO - Command prefix set to 'execute'
+2025-03-15 21:31:54 - DEBUG - Debug logging enabled
+2025-03-15 21:31:54 - INFO - HTTP Request: GET http://127.0.0.1:11434/api/tags "HTTP/1.1 200 OK"
+2025-03-15 21:31:54 - WARNING - Model 'dolphin-llama3:8b-v2.9-q4_0' not found in available models: [None, None, None, None, None, None, None, None, None, None]
+2025-03-15 21:31:54 - INFO - Pulling model 'dolphin-llama3:8b-v2.9-q4_0'...
+2025-03-15 21:31:54 - INFO - HTTP Request: POST http://127.0.0.1:11434/api/pull "HTTP/1.1 200 OK"
+2025-03-15 21:31:54 - INFO - Model 'dolphin-llama3:8b-v2.9-q4_0' pulled successfully
+2025-03-15 21:31:54 - INFO - Connected to Ollama at http://localhost:11434 using Python client
+2025-03-15 21:31:54 - INFO - Initializing Kokoro TTS with model: kokoro-v1.0.onnx, voices: voices-v1.0.bin
+2025-03-15 21:31:55 - INFO - Using voice: bm_lewis, language: en-us, speed: 1.25
+2025-03-15 21:31:55 - INFO - Testing TTS...
+2025-03-15 21:31:55 - INFO - TTS test successful
+2025-03-15 21:31:55 - INFO - HTTP Request: GET http://127.0.0.1:11434/api/tags "HTTP/1.1 200 OK"
+2025-03-15 21:31:55 - WARNING - Model 'dolphin-llama3:8b-v2.9-q4_0' not found in available models: [None, None, None, None, None, None, None, None, None, None]
+2025-03-15 21:31:55 - INFO - Pulling model 'dolphin-llama3:8b-v2.9-q4_0'...
+2025-03-15 21:31:56 - INFO - HTTP Request: POST http://127.0.0.1:11434/api/pull "HTTP/1.1 200 OK"
+2025-03-15 21:31:56 - INFO - Model 'dolphin-llama3:8b-v2.9-q4_0' pulled successfully
+2025-03-15 21:31:56 - INFO - Connected to Ollama at http://localhost:11434 using Python client
+2025-03-15 21:31:56 - INFO - Signal handlers registered
+2025-03-15 21:31:56 - INFO - Speaking greeting: Hello! Maxwell here.
+2025-03-15 21:31:59 - INFO - Adjusting for ambient noise...
+2025-03-15 21:32:00 - INFO - Listening for speech...
+2025-03-15 21:32:22 - INFO - Interrupt signal received, stopping...
+2025-03-15 21:32:58 - INFO - Command prefix set to 'execute'
+2025-03-15 21:32:58 - DEBUG - Debug logging enabled
+2025-03-15 21:32:58 - INFO - HTTP Request: GET http://127.0.0.1:11434/api/tags "HTTP/1.1 200 OK"
+2025-03-15 21:32:58 - WARNING - Model 'dolphin-llama3:8b-v2.9-q4_0' not found in available models: [None, None, None, None, None, None, None, None, None, None]
+2025-03-15 21:32:58 - INFO - Pulling model 'dolphin-llama3:8b-v2.9-q4_0'...
+2025-03-15 21:32:58 - INFO - HTTP Request: POST http://127.0.0.1:11434/api/pull "HTTP/1.1 200 OK"
+2025-03-15 21:32:58 - INFO - Model 'dolphin-llama3:8b-v2.9-q4_0' pulled successfully
+2025-03-15 21:32:58 - INFO - Connected to Ollama at http://localhost:11434 using Python client
+2025-03-15 21:32:58 - INFO - Initializing Kokoro TTS with model: kokoro-v1.0.onnx, voices: voices-v1.0.bin
+2025-03-15 21:32:58 - INFO - Using voice: bm_lewis, language: en-us, speed: 1.25
+2025-03-15 21:32:58 - INFO - Testing TTS...
+2025-03-15 21:32:59 - INFO - TTS test successful
+2025-03-15 21:32:59 - INFO - HTTP Request: GET http://127.0.0.1:11434/api/tags "HTTP/1.1 200 OK"
+2025-03-15 21:32:59 - WARNING - Model 'dolphin-llama3:8b-v2.9-q4_0' not found in available models: [None, None, None, None, None, None, None, None, None, None]
+2025-03-15 21:32:59 - INFO - Pulling model 'dolphin-llama3:8b-v2.9-q4_0'...
+2025-03-15 21:32:59 - INFO - HTTP Request: POST http://127.0.0.1:11434/api/pull "HTTP/1.1 200 OK"
+2025-03-15 21:32:59 - INFO - Model 'dolphin-llama3:8b-v2.9-q4_0' pulled successfully
+2025-03-15 21:32:59 - INFO - Connected to Ollama at http://localhost:11434 using Python client
+2025-03-15 21:32:59 - INFO - Signal handlers registered
+2025-03-15 21:32:59 - INFO - Speaking greeting: Hello! Maxwell here.
+2025-03-15 21:33:03 - INFO - Adjusting for ambient noise...
+2025-03-15 21:33:04 - INFO - Listening for speech...
+2025-03-15 21:33:31 - INFO - Interrupt signal received, stopping...
+2025-03-15 21:33:31 - INFO - Interrupt signal received, stopping...
+2025-03-15 21:33:41 - INFO - Command prefix set to 'execute'
+2025-03-15 21:33:41 - DEBUG - Debug logging enabled
+2025-03-15 21:33:41 - INFO - HTTP Request: GET http://127.0.0.1:11434/api/tags "HTTP/1.1 200 OK"
+2025-03-15 21:33:41 - WARNING - Model 'dolphin-llama3:8b-v2.9-q4_0' not found in available models: [None, None, None, None, None, None, None, None, None, None]
+2025-03-15 21:33:41 - INFO - Pulling model 'dolphin-llama3:8b-v2.9-q4_0'...
+2025-03-15 21:33:42 - INFO - HTTP Request: POST http://127.0.0.1:11434/api/pull "HTTP/1.1 200 OK"
+2025-03-15 21:33:42 - INFO - Model 'dolphin-llama3:8b-v2.9-q4_0' pulled successfully
+2025-03-15 21:33:42 - INFO - Connected to Ollama at http://localhost:11434 using Python client
+2025-03-15 21:33:42 - INFO - Initializing Kokoro TTS with model: kokoro-v1.0.onnx, voices: voices-v1.0.bin
+2025-03-15 21:33:42 - INFO - Using voice: bm_lewis, language: en-us, speed: 1.25
+2025-03-15 21:33:42 - INFO - Testing TTS...
+2025-03-15 21:33:43 - INFO - TTS test successful
+2025-03-15 21:33:43 - INFO - HTTP Request: GET http://127.0.0.1:11434/api/tags "HTTP/1.1 200 OK"
+2025-03-15 21:33:43 - WARNING - Model 'dolphin-llama3:8b-v2.9-q4_0' not found in available models: [None, None, None, None, None, None, None, None, None, None]
+2025-03-15 21:33:43 - INFO - Pulling model 'dolphin-llama3:8b-v2.9-q4_0'...
+2025-03-15 21:33:43 - INFO - HTTP Request: POST http://127.0.0.1:11434/api/pull "HTTP/1.1 200 OK"
+2025-03-15 21:33:43 - INFO - Model 'dolphin-llama3:8b-v2.9-q4_0' pulled successfully
+2025-03-15 21:33:43 - INFO - Connected to Ollama at http://localhost:11434 using Python client
+2025-03-15 21:33:43 - INFO - Signal handlers registered
+2025-03-15 21:33:43 - INFO - Speaking greeting: Hello! Maxwell here.
+2025-03-15 21:33:47 - INFO - Adjusting for ambient noise...
+2025-03-15 21:33:48 - INFO - Listening for speech...
+2025-03-15 21:34:29 - INFO - Interrupt signal received, stopping...
+2025-03-15 21:35:29 - INFO - Command prefix set to 'execute'
+2025-03-15 21:35:29 - INFO - HTTP Request: GET http://127.0.0.1:11434/api/tags "HTTP/1.1 200 OK"
+2025-03-15 21:35:29 - WARNING - Model 'dolphin-llama3:8b-v2.9-q4_0' not found in available models: [None, None, None, None, None, None, None, None, None, None]
+2025-03-15 21:35:29 - INFO - Pulling model 'dolphin-llama3:8b-v2.9-q4_0'...
+2025-03-15 21:35:29 - INFO - HTTP Request: POST http://127.0.0.1:11434/api/pull "HTTP/1.1 200 OK"
+2025-03-15 21:35:29 - INFO - Model 'dolphin-llama3:8b-v2.9-q4_0' pulled successfully
+2025-03-15 21:35:29 - INFO - Connected to Ollama at http://localhost:11434 using Python client
+2025-03-15 21:35:29 - INFO - Initializing Kokoro TTS with model: kokoro-v1.0.onnx, voices: voices-v1.0.bin
+2025-03-15 21:35:30 - INFO - Using voice: bm_lewis, language: en-us, speed: 1.25
+2025-03-15 21:35:30 - INFO - Testing TTS...
+2025-03-15 21:35:30 - INFO - TTS test successful
+2025-03-15 21:35:30 - INFO - HTTP Request: GET http://127.0.0.1:11434/api/tags "HTTP/1.1 200 OK"
+2025-03-15 21:35:30 - WARNING - Model 'dolphin-llama3:8b-v2.9-q4_0' not found in available models: [None, None, None, None, None, None, None, None, None, None]
+2025-03-15 21:35:30 - INFO - Pulling model 'dolphin-llama3:8b-v2.9-q4_0'...
+2025-03-15 21:35:31 - INFO - HTTP Request: POST http://127.0.0.1:11434/api/pull "HTTP/1.1 200 OK"
+2025-03-15 21:35:31 - INFO - Model 'dolphin-llama3:8b-v2.9-q4_0' pulled successfully
+2025-03-15 21:35:31 - INFO - Connected to Ollama at http://localhost:11434 using Python client
+2025-03-15 21:35:31 - INFO - Signal handlers registered
+2025-03-15 21:35:31 - INFO - Speaking greeting: Hello! Maxwell here.
+2025-03-15 21:35:34 - INFO - Adjusting for ambient noise...
+2025-03-15 21:35:35 - INFO - Listening for speech...
+2025-03-15 21:35:53 - INFO - Interrupt signal received, stopping...
+2025-03-15 21:36:59 - INFO - HTTP Request: GET http://127.0.0.1:11434/api/tags "HTTP/1.1 200 OK"
+2025-03-15 21:36:59 - WARNING - Model 'dolphin-llama3:8b-v2.9-q4_0' not found in available models: [None, None, None, None, None, None, None, None, None, None]
+2025-03-15 21:36:59 - INFO - Pulling model 'dolphin-llama3:8b-v2.9-q4_0'...
+2025-03-15 21:36:59 - INFO - HTTP Request: POST http://127.0.0.1:11434/api/pull "HTTP/1.1 200 OK"
+2025-03-15 21:36:59 - INFO - Model 'dolphin-llama3:8b-v2.9-q4_0' pulled successfully
+2025-03-15 21:36:59 - INFO - Connected to Ollama at http://localhost:11434 using Python client
+2025-03-15 21:36:59 - INFO - Initializing Kokoro TTS with model: kokoro-v1.0.onnx, voices: voices-v1.0.bin
+2025-03-15 21:36:59 - INFO - Using voice: bm_lewis, language: en-us, speed: 1.25
+2025-03-15 21:36:59 - INFO - Testing TTS...
+2025-03-15 21:37:00 - INFO - TTS test successful
+2025-03-15 21:37:00 - INFO - HTTP Request: GET http://127.0.0.1:11434/api/tags "HTTP/1.1 200 OK"
+2025-03-15 21:37:00 - WARNING - Model 'dolphin-llama3:8b-v2.9-q4_0' not found in available models: [None, None, None, None, None, None, None, None, None, None]
+2025-03-15 21:37:00 - INFO - Pulling model 'dolphin-llama3:8b-v2.9-q4_0'...
+2025-03-15 21:37:00 - INFO - HTTP Request: POST http://127.0.0.1:11434/api/pull "HTTP/1.1 200 OK"
+2025-03-15 21:37:00 - INFO - Model 'dolphin-llama3:8b-v2.9-q4_0' pulled successfully
+2025-03-15 21:37:00 - INFO - Connected to Ollama at http://localhost:11434 using Python client
+2025-03-15 21:37:00 - INFO - Signal handlers registered
+2025-03-15 21:37:00 - INFO - Speaking greeting: Hello! Maxwell here.
+2025-03-15 21:37:04 - INFO - Adjusting for ambient noise...
+2025-03-15 21:37:05 - INFO - Listening for speech...
+2025-03-15 21:37:10 - INFO - Interrupt signal received, stopping...

@@ -450,22 +450,6 @@ class KokoroTTS:
         if not text or not text.strip():
             return
             
-        # Skip if TTS is not initialized
-        if self.kokoro is None:
-            logger.info(f"Would speak (TTS disabled): {text}")
-            last_speaking_time = time.time()  # Update last speaking time even when TTS is disabled
-            waiting_for_user_input = True  # Ready for user input after "speaking"
-            
-            # Call the speech finished callback if set
-            if self.on_speech_finished:
-                self.on_speech_finished()
-            return
-        
-        # Set speaking flag
-        is_speaking = True
-        waiting_for_user_input = False  # Not waiting for input while speaking
-        is_interrupted = False  # Reset interrupted flag
-        
         try:
             # Process text into chunks for better handling
             chunks = self._chunk_text(text)
