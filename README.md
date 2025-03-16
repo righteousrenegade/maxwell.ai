@@ -47,19 +47,6 @@ The assistant supports many command-line options:
 python assistant.py --help
 ```
 
-Common options:
-
-- `--text-input "your query"`: Process a single text input and exit
-- `--no-wake-word`: Disable wake word activation
-- `--wake-word "custom wake word"`: Set a custom wake word
-- `--interrupt-word "custom interrupt word"`: Set a custom interrupt word
-- `--command-prefix "custom prefix"`: Set a custom command prefix
-- `--offline`: Use offline speech recognition with Vosk
-- `--no-tts`: Disable text-to-speech
-- `--list-commands`: List available commands and exit
-- `--list-voices`: List available TTS voices and exit
-- `--list-languages`: List available TTS languages and exit
-
 ### Voice Commands
 
 - Say **"Hey Maxwell"** (or your custom wake word) to activate
@@ -80,12 +67,6 @@ Common options:
 The project has been refactored into a modular structure:
 
 - `assistant.py`: Main assistant class and entry point
-- `tools.py`: Tools like WebBrowser for web search
-- `ollama_client.py`: Client for interacting with Ollama API
-- `tts.py`: Text-to-speech functionality using Kokoro
-- `speech.py`: Speech recognition classes
-- `commands.py`: Command execution functionality
-- `utils.py`: Utility functions and global variables
 
 ## Customization
 

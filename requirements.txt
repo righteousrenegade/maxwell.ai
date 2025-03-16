@@ -16,4 +16,7 @@ ollama>=0.1.0
 vosk>=0.3.32
 
 # Progress bar for downloads
-tqdm>=4.65.0 
+tqdm>=4.65.0
+
+# Model Context Protocol
+mcp>=1.4.1 
