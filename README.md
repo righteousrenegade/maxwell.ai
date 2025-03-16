@@ -4,7 +4,7 @@ A modular voice assistant powered by Ollama LLM and Kokoro TTS.
 
 ## DEMO
 
-[![Watch the demo!](https://raw.githubusercontent.com/righteousrenegade/maxwell.ai/main/assets/maxwelldemo.mp4)](https://raw.githubusercontent.com/righteousrenegade/maxwell.ai/main/assets/maxwelldemo.mp4)
+[![Watch the demo!](media/maxwelldemo.mp4)](media/maxwelldemo.mp4)
 
 
 ## Features
