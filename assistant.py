@@ -8,6 +8,7 @@ from speech import SpeechRecognizer, TextToSpeech
 from commands import CommandExecutor
 from utils import setup_logger, download_models
 from config import Config
+from mcp_tools import MCPToolProvider
 import logging
 
 logger = setup_logger()
@@ -33,6 +34,12 @@ class Maxwell:
         logger.info("Initializing Command Executor...")
         self.command_executor = CommandExecutor(self)
         
+        # Initialize MCP Tool Provider
+        if config.use_mcp:
+            logger.info("Initializing Tool Provider...")
+            self.mcp_provider = MCPToolProvider(self)
+            self.mcp_provider.start_server()
+        
         # Setup signal handlers
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
@@ -51,6 +58,8 @@ class Maxwell:
             self.tts.cleanup()
         if hasattr(self, 'recognizer'):
             self.recognizer.cleanup()
+        if hasattr(self, 'mcp_provider'):
+            self.mcp_provider.stop_server()
             
     def speak(self, text):
         logger.info(f"Speaking: {text}")
@@ -90,7 +99,7 @@ class Maxwell:
         
     def run(self):
         logger.info("Maxwell is running. Say the wake word to begin.")
-        self.speak(f"Maxwell is ready. Say {self.config.wake_word} to begin.")
+        self.speak(f"Hello, Maxwell here.")
         
         # Add a test mode option for immediate conversation
         if self.config.test_mode:
@@ -105,7 +114,7 @@ class Maxwell:
                 wake_word_detected = self.recognizer.detect_wake_word()
                 if wake_word_detected:
                     logger.info("Wake word detected!")
-                    self.speak("I'm listening.")
+                    self.speak("Yes?")
                     self.in_conversation = True
                 else:
                     time.sleep(0.1)  # Prevent CPU hogging
@@ -119,7 +128,7 @@ class Maxwell:
             if self.speaking and self.recognizer.detect_interrupt():
                 self.tts.stop()
                 self.speaking = False
-                self.speak("I'll stop talking.")
+                self.speak("Sure.")
                 continue
                 
             self.handle_query(query)
@@ -128,7 +137,7 @@ class Maxwell:
             if not self.config.continuous_conversation:
                 logger.info("Exiting conversation mode (continuous mode disabled)")
                 self.in_conversation = False
-                self.speak("Let me know if you need anything else by saying the wake word.")
+                self.speak("Call me if you need me.")
 
 def main():
     parser = argparse.ArgumentParser(description="Maxwell Voice Assistant")
@@ -144,6 +153,8 @@ def main():
     parser.add_argument("--ollama-port", default=11434, type=int, help="Ollama port")
     parser.add_argument("--test", action="store_true", help="Test mode - immediately enter conversation mode")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    parser.add_argument("--use-mcp", action="store_true", help="Enable MCP tools integration")
+    parser.add_argument("--mcp-port", default=8080, type=int, help="Port for MCP server")
     
     args = parser.parse_args()
     
@@ -153,6 +164,7 @@ def main():
     
     # List voices if requested
     if args.list_voices:
+        from speech import TextToSpeech
         TextToSpeech.list_available_voices()
         return
         
@@ -170,7 +182,9 @@ def main():
         model=args.model,
         ollama_host=args.ollama_host,
         ollama_port=args.ollama_port,
-        test_mode=args.test
+        test_mode=args.test,
+        use_mcp=args.use_mcp,
+        mcp_port=args.mcp_port
     )
     
     # Create and run assistant

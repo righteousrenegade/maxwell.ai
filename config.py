@@ -9,7 +9,9 @@ class Config:
                  model="dolphin-llama3:8b-v2.9-q4_0",
                  ollama_host="localhost",
                  ollama_port=11434,
-                 test_mode=False):
+                 test_mode=False,
+                 use_mcp=False,
+                 mcp_port=8080):
         self.wake_word = wake_word
         self.interrupt_word = interrupt_word
         self.voice = voice
@@ -19,4 +21,6 @@ class Config:
         self.model = model
         self.ollama_host = ollama_host
         self.ollama_port = ollama_port
-        self.test_mode = test_mode 
+        self.test_mode = test_mode
+        self.use_mcp = use_mcp
+        self.mcp_port = mcp_port 

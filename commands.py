@@ -5,6 +5,7 @@ import threading
 import time
 import ollama
 from utils import setup_logger
+import logging
 
 logger = setup_logger()
 
@@ -30,6 +31,8 @@ class CommandExecutor:
             host=f"http://{self.assistant.config.ollama_host}:{self.assistant.config.ollama_port}"
         )
         self.model = self.assistant.config.model
+        
+        # MCP tools will be registered separately
         
     def execute_command(self, command_text):
         logger.info(f"Executing command: {command_text}")
@@ -58,11 +61,56 @@ class CommandExecutor:
     def query_llm(self, query):
         logger.info(f"Querying LLM with: {query}")
         try:
+            # Add system prompt to encourage tool usage
+            system_prompt = """You are Maxwell, an intelligent voice assistant. You have access to various tools.
+            When appropriate, use these tools to provide better responses.
+            
+            Available tools:
+            """
+            
+            # Add tool descriptions if MCP is enabled
+            if hasattr(self.assistant, 'mcp_provider'):
+                tool_descriptions = self.assistant.mcp_provider.get_tool_descriptions()
+                for name, description in tool_descriptions.items():
+                    system_prompt += f"- {name}: {description}\n"
+                    
+            system_prompt += "\nTo use a tool, include [TOOL:tool_name(param1=value1, param2=value2)] in your response."
+            system_prompt += "\nAlways respond in a helpful, concise, and conversational manner."
+            
             response = self.ollama_client.chat(
                 model=self.model,
-                messages=[{"role": "user", "content": query}]
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": query}
+                ]
             )
-            return response['message']['content']
+            
+            content = response['message']['content']
+            
+            # Process tool calls in the response
+            import re
+            tool_pattern = r'\[TOOL:(\w+)\((.*?)\)\]'
+            
+            def replace_tool_call(match):
+                tool_name = match.group(1)
+                args_str = match.group(2)
+                
+                # Parse arguments
+                kwargs = {}
+                if args_str:
+                    for arg in args_str.split(','):
+                        if '=' in arg:
+                            key, value = arg.split('=', 1)
+                            kwargs[key.strip()] = value.strip().strip('"\'')
+                
+                # Execute the tool
+                result = self.use_tool(tool_name, **kwargs)
+                return result
+                
+            # Replace all tool calls with their results
+            processed_content = re.sub(tool_pattern, replace_tool_call, content)
+            return processed_content
+            
         except Exception as e:
             logger.error(f"Error querying LLM: {e}")
             return f"I'm sorry, I encountered an error: {str(e)}"
@@ -193,4 +241,12 @@ class CommandExecutor:
         for cmd in self.available_commands.keys():
             help_text += f"{cmd}, "
         help_text = help_text[:-2]  # Remove trailing comma and space
-        self.assistant.speak(help_text) 
+        self.assistant.speak(help_text)
+        
+    def use_tool(self, tool_name, **kwargs):
+        """Use a tool from the MCP tool provider"""
+        if hasattr(self.assistant, 'mcp_provider'):
+            result = self.assistant.mcp_provider.execute_tool(tool_name, **kwargs)
+            return result
+        else:
+            return f"Tool {tool_name} not available (MCP not enabled)" 
