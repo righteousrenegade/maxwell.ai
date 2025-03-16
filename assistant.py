@@ -10,6 +10,7 @@ from utils import setup_logger, download_models
 from config import Config
 from mcp_tools import MCPToolProvider
 import logging
+import threading
 
 logger = setup_logger()
 
@@ -64,8 +65,24 @@ class Maxwell:
     def speak(self, text):
         logger.info(f"Speaking: {text}")
         self.speaking = True
+        
+        # Start background listening for interrupts
+        self.recognizer.start_background_listening()
+        
+        # Speak the text
         self.tts.speak(text)
+        
+        # Stop background listening
+        self.recognizer.stop_background_listening()
         self.speaking = False
+        
+        # Check if we were interrupted
+        if self.recognizer.is_interrupt_detected():
+            logger.info("Speech was interrupted")
+            self.recognizer.reset_interrupt()
+            return True  # Indicate that speech was interrupted
+        
+        return False  # Speech completed normally
         
     def listen(self):
         return self.recognizer.listen()
@@ -95,7 +112,12 @@ class Maxwell:
             
         # Otherwise, send to LLM
         response = self.command_executor.query_llm(query)
-        self.speak(response)
+        was_interrupted = self.speak(response)
+        
+        # If interrupted, acknowledge it
+        if was_interrupted:
+            logger.info("Response was interrupted")
+            self.speak("I'll stop there. What else would you like to know?")
         
     def run(self):
         logger.info("Maxwell is running. Say the wake word to begin.")
@@ -107,37 +129,51 @@ class Maxwell:
             self.speak("Test mode enabled. I'm listening.")
             self.in_conversation = True
         
-        while self.running:
-            # Listen for wake word or in conversation mode
-            if not self.in_conversation:
-                logger.info(f"Waiting for wake word: '{self.config.wake_word}'")
-                wake_word_detected = self.recognizer.detect_wake_word()
-                if wake_word_detected:
-                    logger.info("Wake word detected!")
-                    self.speak("Yes?")
-                    self.in_conversation = True
-                else:
-                    time.sleep(0.1)  # Prevent CPU hogging
-                    continue
-            
-            # In conversation mode
-            logger.info("In conversation mode, listening for query...")
-            query = self.listen()
-            
-            # Check for interrupt
-            if self.speaking and self.recognizer.detect_interrupt():
-                self.tts.stop()
-                self.speaking = False
-                self.speak("Sure.")
-                continue
+        # Create a thread to check for interrupts
+        def check_interrupts():
+            while self.running:
+                if self.speaking and self.recognizer.is_interrupt_detected():
+                    logger.info("Interrupt detected by background checker")
+                    self.tts.stop()
+                    self.speaking = False
+                    self.recognizer.reset_interrupt()
+                    # Don't speak here to avoid recursion
+                time.sleep(0.1)  # Check frequently but not too often
+        
+        interrupt_checker = threading.Thread(target=check_interrupts, daemon=True)
+        interrupt_checker.start()
+        
+        try:
+            while self.running:
+                # Listen for wake word or in conversation mode
+                if not self.in_conversation:
+                    logger.info(f"Waiting for wake word: '{self.config.wake_word}'")
+                    wake_word_detected = self.recognizer.detect_wake_word()
+                    if wake_word_detected:
+                        logger.info("Wake word detected!")
+                        was_interrupted = self.speak("Yes?")
+                        if not was_interrupted:
+                            self.in_conversation = True
+                    else:
+                        time.sleep(0.1)  # Prevent CPU hogging
+                        continue
                 
-            self.handle_query(query)
-            
-            # If not in continuous conversation mode, exit after one interaction
-            if not self.config.continuous_conversation:
-                logger.info("Exiting conversation mode (continuous mode disabled)")
-                self.in_conversation = False
-                self.speak("Call me if you need me.")
+                # In conversation mode
+                logger.info("In conversation mode, listening for query...")
+                query = self.listen()
+                
+                # Handle the query
+                self.handle_query(query)
+                
+                # If not in continuous conversation mode, exit after one interaction
+                if not self.config.continuous_conversation:
+                    logger.info("Exiting conversation mode (continuous mode disabled)")
+                    self.in_conversation = False
+                    was_interrupted = self.speak("Call me if you need me.")
+        finally:
+            # Make sure we stop the background thread
+            self.running = False
+            interrupt_checker.join(timeout=1)
 
 def main():
     parser = argparse.ArgumentParser(description="Maxwell Voice Assistant")
