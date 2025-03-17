@@ -904,25 +904,74 @@ class StreamingMaxwell:
             self.audio_manager.set_debug_mode(True)
             logger.debug("Audio debug mode enabled")
         
-        # Check if Ollama is available before starting audio
-        if hasattr(self.command_executor, 'check_ollama_connection'):
+        # Display LLM provider information
+        llm_provider = self.command_executor.llm_provider
+        logger.info(f"Using LLM provider: {llm_provider}")
+        
+        if llm_provider == "ollama":
+            # Check if Ollama is available
             ollama_available = self.command_executor.check_ollama_connection(force=True, detailed=True)
             if ollama_available:
                 logger.info(f"✅ Ollama LLM service is available with model: {self.config.model}")
                 print(f"🧠 Ollama LLM available with model: {self.config.model}")
+                print(f"   Host: {self.config.ollama_host}:{self.config.ollama_port}")
             else:
                 logger.warning("❌ Ollama LLM service is not available, only direct commands will work")
+                self._display_command_only_message("Ollama", "check ollama")
+        
+        elif llm_provider == "openai":
+            # Check if OpenAI is available
+            openai_available = self.command_executor.check_openai_connection(force=True, detailed=True)
+            if openai_available:
+                logger.info(f"✅ OpenAI API is available with model: {self.config.openai_model}")
+                print(f"🧠 OpenAI API available with model: {self.config.openai_model}")
+                print(f"   Base URL: {self.config.openai_base_url}")
+            else:
+                logger.warning("❌ OpenAI API is not available, only direct commands will work")
+                self._display_command_only_message("OpenAI", "check openai")
+                
+                # Offer to switch to Ollama if available
                 print("\n" + "="*60)
-                print("⚠️ COMMAND-ONLY MODE: Ollama LLM service is not available")
+                print("🔄 PROVIDER SWITCHING OPTIONS:")
+                print("OpenAI connection failed. You have these options:")
+                print("1. Continue with OpenAI provider (commands only, no LLM)")
+                print("2. Try using Ollama as fallback")
+                print("3. Exit and restart with different options")
                 print("="*60)
-                print("You can use these direct commands:")
-                commands = sorted([cmd for cmd in self.command_executor.available_commands.keys() 
-                                 if len(cmd.split()) == 1 and cmd not in ["what", "what's", "tell"]])
-                print(", ".join(commands))
-                print("="*60 + "\n")
-                print("💡 To use a command, say: 'execute [command]'")
-                print("💡 Example: 'execute time' or 'execute joke'")
-                print("💡 To check connectivity, use 'execute check ollama' command.")
+                
+                try:
+                    choice = input("Enter your choice (1-3): ").strip()
+                    
+                    if choice == "2":
+                        # Try to switch to Ollama
+                        switched = self.command_executor.try_switch_to_ollama()
+                        if switched:
+                            # Update config to match new provider
+                            self.config.llm_provider = "ollama"
+                            print("✅ Successfully switched to Ollama provider")
+                            # Update provider variables
+                            llm_provider = "ollama"
+                        else:
+                            print("❌ Could not switch to Ollama provider")
+                            print("Continuing with OpenAI in command-only mode")
+                    elif choice == "3":
+                        print("Exiting. Restart with different options.")
+                        print("Example: --llm-provider=ollama")
+                        self.cleanup()
+                        sys.exit(0)
+                    else:
+                        print("Continuing with OpenAI in command-only mode")
+                except KeyboardInterrupt:
+                    print("\nOperation cancelled by user. Continuing with current settings.")
+                except Exception as e:
+                    logger.error(f"Error during provider switch: {e}")
+                    print(f"Error: {e}")
+                    print("Continuing with current settings.")
+        
+        else:
+            # Unknown provider
+            logger.warning(f"❌ Unknown LLM provider: {llm_provider}, only direct commands will work")
+            self._display_command_only_message(llm_provider, "")
         
         # Start the audio manager
         self.audio_manager.start(wake_word=self.wake_word, interrupt_word=self.interrupt_word)
@@ -933,6 +982,66 @@ class StreamingMaxwell:
         print("  • Press SPACE while Maxwell is speaking to interrupt speech")
         print("  • Press Ctrl+C twice quickly to exit the program")
         print("="*60 + "\n")
+        
+        # Add more detailed OpenAI connection checks if that's the selected provider
+        if llm_provider == "openai":
+            print("\n" + "="*60)
+            print(f"🔍 CHECKING OPENAI CONNECTION DETAILS:")
+            print(f"  • Provider:    {self.config.llm_provider}")
+            print(f"  • Base URL:    {self.config.openai_base_url}")
+            print(f"  • Model:       {self.config.openai_model}")
+            print(f"  • API Key:     {'Set' if self.config.openai_api_key and self.config.openai_api_key != 'None' else 'NOT SET'}")
+            
+            # Check if API key is missing or set to literal "None"
+            if not self.config.openai_api_key or self.config.openai_api_key == "None":
+                print("\n⚠️ ERROR: OpenAI API key is not set or is set to 'None'")
+                print("Please provide a valid API key with --openai-api-key")
+                print("Example: --openai-api-key=sk-your-key-here")
+                
+                # Try to see if we can switch to offline mode or Ollama
+                print("\n💡 SUGGESTION: Switch to Ollama provider or fix the API key")
+                print("Example: --llm-provider=ollama")
+                print("="*60 + "\n")
+            
+            # Check if base URL might be invalid
+            if "://" not in self.config.openai_base_url:
+                print("\n⚠️ WARNING: OpenAI base URL looks invalid (missing protocol)")
+                print(f"Current value: {self.config.openai_base_url}")
+                print("Should include http:// or https://")
+                print("Example: --openai-base-url=https://api.openai.com/v1")
+                print("="*60 + "\n")
+            
+            # If we detect localhost in the URL, check if port is open
+            if "localhost" in self.config.openai_base_url or "127.0.0.1" in self.config.openai_base_url:
+                import socket
+                host = "localhost"
+                # Try to extract port from URL
+                port = None
+                try:
+                    port_str = self.config.openai_base_url.split("://")[1].split(":")[1].split("/")[0]
+                    port = int(port_str)
+                except:
+                    print("\n⚠️ WARNING: Could not determine port from OpenAI base URL")
+                    print("If you're using a local server, make sure port is specified")
+                    print("Example: --openai-base-url=http://localhost:1234/v1")
+                    
+                if port:
+                    print(f"\n🔍 Checking if port {port} is open on {host}...")
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.settimeout(2)
+                    try:
+                        result = s.connect_ex((host, port))
+                        if result == 0:
+                            print(f"✅ Port {port} is open on {host}")
+                        else:
+                            print(f"❌ Port {port} is CLOSED on {host}")
+                            print(f"Make sure your local OpenAI API server is running on port {port}")
+                    except Exception as e:
+                        print(f"❌ Error checking port: {e}")
+                    finally:
+                        s.close()
+                        
+                print("="*60 + "\n")
         
         # Announce startup
         self.speak(f"Hello, Maxwell here. Say '{self.wake_word}' to get my attention.")
@@ -1094,6 +1203,21 @@ class StreamingMaxwell:
             # Silently fail if sound can't be played
             pass
 
+    def _display_command_only_message(self, provider_name, check_command):
+        """Display a message about command-only mode with available commands"""
+        print("\n" + "="*60)
+        print(f"⚠️ COMMAND-ONLY MODE: {provider_name} LLM service is not available")
+        print("="*60)
+        print("You can use these direct commands:")
+        commands = sorted([cmd for cmd in self.command_executor.available_commands.keys() 
+                         if len(cmd.split()) == 1 and cmd not in ["what", "what's", "tell"]])
+        print(", ".join(commands))
+        print("="*60 + "\n")
+        print("💡 To use a command, say: 'execute [command]'")
+        print("💡 Example: 'execute time' or 'execute joke'")
+        if check_command:
+            print(f"💡 To check connectivity, use 'execute {check_command}' command.")
+
 def main():
     parser = argparse.ArgumentParser(description="Maxwell Voice Assistant (Streaming Edition)")
     parser.add_argument("--wake-word", default="hello maxwell", help="Wake word to activate the assistant")
@@ -1103,9 +1227,33 @@ def main():
     parser.add_argument("--offline", action="store_true", help="Use offline speech recognition")
     parser.add_argument("--continuous", action="store_true", help="Stay in conversation mode until explicitly ended")
     parser.add_argument("--list-voices", action="store_true", help="List available TTS voices and exit")
-    parser.add_argument("--model", default="dolphin-llama3:8b-v2.9-q4_0", help="Ollama model to use")
-    parser.add_argument("--ollama-host", default="localhost", help="Ollama host address")
-    parser.add_argument("--ollama-port", default=11434, type=int, help="Ollama port")
+    
+    # LLM provider options
+    llm_group = parser.add_argument_group('LLM Provider Options')
+    llm_group.add_argument("--llm-provider", default="openai", choices=["ollama", "openai"], 
+                           help="LLM provider to use (ollama or openai)")
+    
+    # Ollama options
+    ollama_group = parser.add_argument_group('Ollama Options')
+    ollama_group.add_argument("--model", default="dolphin-llama3:8b-v2.9-q4_0", help="Ollama model to use")
+    ollama_group.add_argument("--ollama-host", default="localhost", help="Ollama host address")
+    ollama_group.add_argument("--ollama-port", default=11434, type=int, help="Ollama port")
+    
+    # OpenAI options
+    openai_group = parser.add_argument_group('OpenAI Options')
+    openai_group.add_argument("--openai-api-key", default="n/a", help="OpenAI API key (optional for local APIs)")
+    openai_group.add_argument("--openai-base-url", default="http://localhost:1234/v1",
+                             help="OpenAI API base URL (can be a local server URL)")
+    openai_group.add_argument("--openai-model", default="gpt-3.5-turbo", 
+                             help="OpenAI model name")
+    openai_group.add_argument("--openai-system-prompt", 
+                             help="System prompt for OpenAI chat completions")
+    openai_group.add_argument("--openai-temperature", type=float, default=0.7,
+                             help="Temperature for OpenAI completions (0.0-2.0)")
+    openai_group.add_argument("--openai-max-tokens", type=int,
+                             help="Max tokens for OpenAI completions")
+    
+    # Other options
     parser.add_argument("--test", action="store_true", help="Test mode - immediately enter conversation mode")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument("--use-mcp", action="store_true", help="Enable MCP tools integration")
@@ -1170,13 +1318,25 @@ def main():
         always_listen=args.always_listen,
         energy_threshold=args.energy_threshold,
         save_audio=args.save_audio,
-        sample_rate=args.sample_rate
+        sample_rate=args.sample_rate,
+        # OpenAI options
+        llm_provider=args.llm_provider,
+        openai_api_key=args.openai_api_key,
+        openai_base_url=args.openai_base_url,
+        openai_model=args.openai_model,
+        openai_system_prompt=args.openai_system_prompt,
+        openai_temperature=args.openai_temperature,
+        openai_max_tokens=args.openai_max_tokens
     )
     
     # Log the configuration
     logger.info(f"Starting Maxwell (Streaming Edition) with configuration:")
     for key, value in vars(config).items():
-        logger.info(f"  {key}: {value}")
+        # Don't log API keys
+        if key == "openai_api_key" and value:
+            logger.info(f"  {key}: [REDACTED]")
+        else:
+            logger.info(f"  {key}: {value}")
     
     # Create and run assistant
     assistant = StreamingMaxwell(config)
