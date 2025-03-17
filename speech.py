@@ -1,18 +1,24 @@
 import os
 import tempfile
-import time
-import threading
 import sounddevice as sd
 import soundfile as sf
 import numpy as np
+import threading
+import time
 from kokoro_onnx import Kokoro
 from utils import setup_logger
 import logging
+import platform
+import traceback
+import msvcrt  # Windows-specific module for keyboard input without blocking
 
 # Get the logger instance
 logger = logging.getLogger("maxwell")
 if not logger.handlers:
     logger = setup_logger()
+
+# Global flag for interruption
+_interrupt_playback = False
 
 class TextToSpeech:
     def __init__(self, voice="bm_lewis", speed=1.25):
@@ -38,8 +44,9 @@ class TextToSpeech:
         # Validate and set the voice
         self.voice_style = self.validate_voice(voice, self.tts)
         
-        self.stop_event = threading.Event()
         self.temp_dir = tempfile.mkdtemp()
+        self._speech_queue = []
+        self._is_speaking = False
         
     def validate_voice(self, voice, kokoro):
         """Validate if the voice is supported and handle voice blending."""
@@ -94,10 +101,11 @@ class TextToSpeech:
         if not text:
             return
             
-        # Reset stop event
-        self.stop_event.clear()
-        
         try:
+            # Reset the global interrupt flag
+            global _interrupt_playback
+            _interrupt_playback = False
+            
             # Generate audio using the 'create' method
             if isinstance(self.voice_style, np.ndarray):
                 # Using a blended voice style
@@ -130,17 +138,19 @@ class TextToSpeech:
             # Write audio to file
             sf.write(temp_file, audio, sample_rate)
             
+            # Print instructions for interrupting speech
+            print("Press SPACE to interrupt speech")
+            
             # Play audio
             self._play_audio(temp_file)
             
         except Exception as e:
             logger.error(f"Error in speech synthesis: {e}")
-            import traceback
             logger.error(f"Traceback: {traceback.format_exc()}")
             logger.error(f"Failed to speak: {text}")
             
     def _play_audio(self, audio_file):
-        """Play audio file with interruption support"""
+        """Play audio file with support for interruption via keyboard"""
         try:
             # Load the audio file
             data, fs = sf.read(audio_file)
@@ -159,29 +169,94 @@ class TextToSpeech:
                     indices = np.arange(0, len(data), step)
                     data = data[indices.astype(int)]
             
-            # Play the audio
-            sd.play(data, fs)
+            # Set flag that we're speaking
+            self._is_speaking = True
             
-            # Wait for playback to finish or stop event
-            while sd.get_stream().active and not self.stop_event.is_set():
-                time.sleep(0.1)
+            # Use non-blocking play with manual keyboard interrupt detection
+            try:
+                # Convert to float32 to avoid dtype mismatch
+                data = data.astype(np.float32)
+                
+                # Start playback non-blocking
+                logger.info("Starting audio playback (press SPACE to interrupt)")
+                sd.play(data, fs, blocking=False)
+                
+                # Monitor for keyboard interrupts while audio is playing
+                while sd.get_stream().active:
+                    # Check if a key is pressed without blocking
+                    if msvcrt.kbhit():
+                        key = msvcrt.getch()
+                        # Check if space key was pressed (byte code 32)
+                        if key == b' ':
+                            logger.info("SPACE key pressed, interrupting speech")
+                            print("\n🛑 Speech interrupted!")
+                            sd.stop()
+                            
+                            # Play an interruption beep
+                            try:
+                                if platform.system() == 'Windows':
+                                    # Use Windows-specific beep
+                                    import winsound
+                                    winsound.Beep(600, 120)  # Lower-pitched longer beep for interruption
+                                else:
+                                    # Cross-platform alternative
+                                    print('\a', end='', flush=True)  # ASCII bell character
+                            except Exception as e:
+                                logger.debug(f"Error playing interruption beep: {e}")
+                                
+                            break
+                    # Brief sleep to prevent CPU hogging
+                    time.sleep(0.05)
+                
+            except Exception as e:
+                logger.error(f"Audio playback error: {e}")
+                sd.stop()  # Make sure playback is stopped on error
             
-            # Stop playback if interrupted
-            if self.stop_event.is_set():
-                sd.stop()
-                logger.info("Audio playback stopped")
+            # Clear speaking flag when done
+            self._is_speaking = False
             
         except Exception as e:
             logger.error(f"Error playing audio: {e}")
-            import traceback
             logger.error(f"Traceback: {traceback.format_exc()}")
+            self._is_speaking = False
             
     def stop(self):
-        """Stop the current speech."""
-        logger.info("Stopping speech...")
-        self.stop_event.set()
+        """Immediately stop any ongoing speech"""
+        try:
+            # Set the global flag to interrupt playback
+            global _interrupt_playback
+            _interrupt_playback = True
+            logger.info("Setting interrupt flag to stop audio playback")
+            
+            # Additionally, try to stop any playing sound using sounddevice
+            try:
+                sd.stop()
+                logger.info("Called sounddevice.stop()")
+            except:
+                pass
+                
+            # Additionally, try to stop any playing sound using platform-specific methods
+            if platform.system() == 'Windows':
+                import winsound
+                # Stop any playing waveform
+                try:
+                    winsound.PlaySound(None, winsound.SND_PURGE)
+                    logger.info("Called winsound.PlaySound(None, SND_PURGE)")
+                except:
+                    pass
+                    
+            # Clear any queue we might have
+            self._speech_queue = []
+            
+            logger.info("TTS playback stop requested")
+        except Exception as e:
+            logger.error(f"Error stopping TTS: {e}")
+            logger.error(traceback.format_exc())
         
     def cleanup(self):
+        # Stop any ongoing playback
+        self.stop()
+        
         # Clean up temporary files
         if hasattr(self, 'temp_dir') and os.path.exists(self.temp_dir):
             for file in os.listdir(self.temp_dir):

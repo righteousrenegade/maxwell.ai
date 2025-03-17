@@ -13,7 +13,6 @@ class Config:
         test_mode=False,
         use_mcp=False,
         mcp_port=8080,
-        keyboard_interrupt=False,
         keyboard_mode=False,
         mic_index=None,
         always_listen=False,
@@ -21,7 +20,6 @@ class Config:
         debug=False,
         save_audio=False,
         sample_rate=None,
-        auto_find_mic=False,
         listen_timeout=7
     ):
         self.wake_word = wake_word
@@ -36,7 +34,6 @@ class Config:
         self.test_mode = test_mode
         self.use_mcp = use_mcp
         self.mcp_port = mcp_port
-        self.keyboard_interrupt = keyboard_interrupt
         self.keyboard_mode = keyboard_mode
         self.mic_index = mic_index
         self.always_listen = always_listen
@@ -44,5 +41,4 @@ class Config:
         self.debug = debug
         self.save_audio = save_audio
         self.sample_rate = sample_rate
-        self.auto_find_mic = auto_find_mic
         self.listen_timeout = listen_timeout 

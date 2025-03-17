@@ -1,12 +1,9 @@
-import threading
-import queue
 import time
 import speech_recognition as sr
-import numpy as np
 import logging
 import os
 import traceback
-import sys
+import threading
 from utils import setup_logger
 
 # Get the logger instance
@@ -19,19 +16,12 @@ class AudioManager:
     Centralized manager for all audio input and processing.
     Only ONE instance of this class should exist in the entire application.
     """
-    def __init__(self, mic_index=None, energy_threshold=300):  # Lower default threshold
+    def __init__(self, mic_index=None, energy_threshold=300):
         self.mic_index = mic_index
         self.recognizer = sr.Recognizer()
         self.recognizer.energy_threshold = energy_threshold
-        self.recognizer.dynamic_energy_threshold = False  # Disable dynamic threshold
-        self.recognizer.pause_threshold = 0.5  # Shorter pause threshold for faster response
-        
-        # Audio processing thread
-        self.running = False
-        self.processing_thread = None
-        
-        # Queue for audio chunks
-        self.audio_queue = queue.Queue(maxsize=100)
+        self.recognizer.dynamic_energy_threshold = False
+        self.recognizer.pause_threshold = 0.5
         
         # Callbacks
         self.on_speech_detected = None
@@ -42,25 +32,25 @@ class AudioManager:
         self.interrupt_word = None
         self.in_conversation = False
         
-        # Interrupt signal
-        self.interrupt_signal = threading.Event()
+        # Background listening
+        self.listening_thread = None
+        self.should_stop = False
+        self.microphone = None
+        self.last_audio_timestamp = 0
         
         # Debug info
         self.last_recognition_time = 0
         self.recognition_count = 0
-        self.listen_attempts = 0
-        self.listen_successes = 0
         self.recognition_attempts = 0
         self.recognition_successes = 0
         
-        # List available microphones and validate the selected index
+        # List available microphones
         self._list_microphones()
         
         logger.info(f"AudioManager initialized with energy threshold: {energy_threshold}")
-        logger.info(f"Recognizer settings: dynamic_threshold={self.recognizer.dynamic_energy_threshold}, pause_threshold={self.recognizer.pause_threshold}")
         
     def _list_microphones(self):
-        """List available microphones for debugging purposes and validate mic_index"""
+        """List available microphones for debugging purposes"""
         try:
             mics = sr.Microphone.list_microphone_names()
             logger.info(f"Found {len(mics)} microphones:")
@@ -72,211 +62,119 @@ class AudioManager:
                     logger.info(f"Selected microphone {self.mic_index}: {mics[self.mic_index]}")
                 else:
                     logger.error(f"Selected microphone index {self.mic_index} is out of range (max: {len(mics)-1})")
-                    logger.error("This will likely cause errors. Please select a valid microphone index.")
-                    # Don't exit here, let the user see the error and available mics
             else:
                 logger.info("Using default microphone")
                 
         except Exception as e:
             logger.error(f"Error listing microphones: {e}")
             logger.error(traceback.format_exc())
+    
+    def _print_status_periodically(self):
+        """Periodically print listening status"""
+        now = time.time()
+        if now - self.last_audio_timestamp > 5:  # Every 5 seconds with no audio
+            print("👂 Still listening... (no speech detected)")
+            logger.info("Still listening for speech input...")
+            self.last_audio_timestamp = now
+    
+    def _background_listening_thread(self):
+        """Background thread that continuously listens for speech"""
+        logger.info("Background listening thread started")
+        print("🎤 Microphone activated and listening")
         
-    def start(self, wake_word=None, interrupt_word=None):
-        """Start the audio processing thread"""
-        if self.running:
-            logger.warning("AudioManager is already running")
-            return
-            
-        self.wake_word = wake_word.lower() if wake_word else None
-        self.interrupt_word = interrupt_word.lower() if interrupt_word else None
-        logger.info(f"Starting AudioManager with wake_word='{self.wake_word}', interrupt_word='{self.interrupt_word}'")
-        
-        self.running = True
-        self.processing_thread = threading.Thread(target=self._process_audio_loop, daemon=True)
-        self.processing_thread.start()
-        logger.info("AudioManager started")
-        
-    def stop(self):
-        """Stop the audio processing thread"""
-        logger.info("Stopping AudioManager...")
-        self.running = False
-        if self.processing_thread:
-            self.processing_thread.join(timeout=2)
-            self.processing_thread = None
-        logger.info("AudioManager stopped")
-        
-    def set_conversation_mode(self, enabled):
-        """Set whether we're in conversation mode"""
-        self.in_conversation = enabled
-        logger.info(f"Conversation mode: {enabled}")
-        
-    def is_in_conversation(self):
-        """Check if we're in conversation mode"""
-        return self.in_conversation
-        
-    def send_interrupt_signal(self):
-        """Send a signal to interrupt any ongoing speech"""
-        self.interrupt_signal.set()
-        logger.info("Interrupt signal sent")
-        
-    def clear_interrupt_signal(self):
-        """Clear the interrupt signal"""
-        self.interrupt_signal.clear()
-        
-    def is_interrupt_signaled(self):
-        """Check if an interrupt has been signaled"""
-        return self.interrupt_signal.is_set()
-        
-    def _process_audio_loop(self):
-        """Main audio processing loop"""
-        logger.info("Audio processing loop started")
-        
-        while self.running:
-            try:
-                # Get microphone
-                if self.mic_index is not None:
-                    logger.info(f"Opening microphone with index {self.mic_index}")
-                    try:
-                        # Try to create the microphone with the specified index
-                        mic = sr.Microphone(device_index=self.mic_index)
-                        
-                        # Test if the microphone can be opened
-                        logger.info("Testing if microphone can be opened...")
-                        with mic as source:
-                            # Just open and close to test
-                            pass
-                        logger.info(f"Successfully opened microphone with index {self.mic_index}")
-                    except Exception as e:
-                        logger.error(f"Failed to open microphone with index {self.mic_index}: {e}")
-                        logger.error(traceback.format_exc())
-                        
-                        # Try to list available microphones again for debugging
-                        try:
-                            mics = sr.Microphone.list_microphone_names()
-                            logger.info(f"Available microphones ({len(mics)}):")
-                            for i, mic_name in enumerate(mics):
-                                logger.info(f"  {i}: {mic_name}")
-                        except Exception as list_err:
-                            logger.error(f"Error listing microphones: {list_err}")
-                        
-                        # Fall back to default microphone
-                        logger.info("Falling back to default microphone")
-                        mic = sr.Microphone()
-                        
-                        # Test if the default microphone can be opened
-                        try:
-                            logger.info("Testing if default microphone can be opened...")
-                            with mic as source:
-                                # Just open and close to test
-                                pass
-                            logger.info("Default microphone opened successfully")
-                        except Exception as default_err:
-                            logger.error(f"Failed to open default microphone: {default_err}")
-                            logger.error("No working microphone found. Waiting before retrying...")
-                            time.sleep(5)  # Wait before retrying
-                            continue  # Skip to the next iteration of the loop
-                else:
-                    logger.info("Opening default microphone")
-                    mic = sr.Microphone()
-                    
-                    # Test if the default microphone can be opened
-                    try:
-                        logger.info("Testing if default microphone can be opened...")
-                        with mic as source:
-                            # Just open and close to test
-                            pass
-                        logger.info("Default microphone opened successfully")
-                    except Exception as default_err:
-                        logger.error(f"Failed to open default microphone: {default_err}")
-                        logger.error("No working microphone found. Waiting before retrying...")
-                        time.sleep(5)  # Wait before retrying
-                        continue  # Skip to the next iteration of the loop
-                
-                logger.info("Microphone opened successfully")
-                
-                # Use the microphone in a with statement
-                with mic as source:
-                    # Adjust for ambient noise once at the beginning
-                    logger.info("Adjusting for ambient noise (this may take a moment)...")
-                    try:
-                        self.recognizer.adjust_for_ambient_noise(source, duration=1.0)
-                        logger.info(f"Energy threshold after adjustment: {self.recognizer.energy_threshold}")
-                    except Exception as e:
-                        logger.error(f"Error adjusting for ambient noise: {e}")
-                        logger.error(traceback.format_exc())
-                        # Continue with the current threshold
-                        logger.info(f"Continuing with current energy threshold: {self.recognizer.energy_threshold}")
-                    
-                    # Continuous listening loop
-                    logger.info("Starting continuous listening loop...")
-                    listen_count = 0
-                    
-                    # Keep listening as long as we're running and the microphone is open
-                    while self.running:
-                        try:
-                            # Log periodically to show we're still listening
-                            listen_count += 1
-                            if listen_count % 10 == 0:
-                                logger.debug(f"Still listening... (attempt {listen_count})")
-                            
-                            self.listen_attempts += 1
-                            logger.debug(f"Listening for audio... (attempt {self.listen_attempts})")
-                            
-                            # Listen for audio with a short timeout
-                            start_time = time.time()
-                            audio = self.recognizer.listen(source, timeout=3)
-                            duration = time.time() - start_time
-                            
-                            self.listen_successes += 1
-                            logger.debug(f"Audio captured after {duration:.2f}s (success {self.listen_successes}/{self.listen_attempts})")
-                            
-                            # Process the audio in a separate thread to avoid blocking
-                            logger.debug("Starting audio processing thread")
-                            threading.Thread(
-                                target=self._process_audio,
-                                args=(audio,),
-                                daemon=True,
-                                name=f"AudioProcessor-{self.listen_successes}"
-                            ).start()
-                            
-                        except sr.WaitTimeoutError:
-                            # This is normal, just continue
-                            logger.debug("No speech detected in timeout period")
-                            continue
-                        except Exception as e:
-                            logger.error(f"Error in listening loop: {e}")
-                            logger.error(traceback.format_exc())
-                            # If we get an error with the microphone, break out of the inner loop
-                            # to reinitialize the microphone
-                            if "Audio source must be entered" in str(e) or "NoneType" in str(e):
-                                logger.error("Microphone error detected, reinitializing...")
-                                break
-                            time.sleep(0.1)  # Prevent tight loop on error
-            
-            except Exception as e:
-                logger.error(f"Error in audio processing main loop: {e}")
-                logger.error(traceback.format_exc())
-                time.sleep(1)  # Wait before retrying
-                
-        logger.info("Audio processing loop stopped")
-        
-    def _process_audio(self, audio):
-        """Process an audio chunk"""
+        # Create and configure microphone
         try:
-            # Log audio properties
-            logger.debug(f"Processing audio: duration={len(audio.frame_data)/audio.sample_rate:.2f}s, " +
-                        f"sample_rate={audio.sample_rate}Hz, frame_count={len(audio.frame_data)}")
-            
+            with self.microphone as source:
+                # Adjust for ambient noise once at the beginning
+                logger.info("Adjusting for ambient noise...")
+                print("⚙️ Calibrating microphone for ambient noise...")
+                try:
+                    self.recognizer.adjust_for_ambient_noise(source, duration=1.0)
+                    logger.info(f"Energy threshold after adjustment: {self.recognizer.energy_threshold}")
+                    print(f"✅ Microphone calibrated (sensitivity: {self.recognizer.energy_threshold:.1f})")
+                except Exception as e:
+                    logger.error(f"Error adjusting for ambient noise: {e}")
+                    print("❌ Failed to calibrate microphone")
+                    return
+                
+                self.last_audio_timestamp = time.time()
+                listen_count = 0
+                    
+                # Main listening loop
+                while not self.should_stop:
+                    try:
+                        # Use a very short timeout to allow checking the stop flag frequently
+                        listen_count += 1
+                        if listen_count % 3 == 0:  # Every 3 listen attempts
+                            self._print_status_periodically()
+                            
+                        logger.debug("Listening for speech...")
+                        logger.info(f"👂 Waiting for speech... (listen attempt #{listen_count})")
+                        
+                        # This is where speech recognition happens
+                        audio = self.recognizer.listen(source, timeout=1)
+                        
+                        # Audio was detected!
+                        self.last_audio_timestamp = time.time()
+                        print("🔊 Audio detected! Processing...")
+                        logger.info(f"Audio detected (length: {len(audio.frame_data)/audio.sample_rate:.2f}s)")
+                        
+                        # Check if we should stop
+                        if self.should_stop:
+                            logger.info("Stop flag detected after audio capture, exiting loop")
+                            break
+                        
+                        # Process the audio
+                        self._speech_callback(self.recognizer, audio)
+                        
+                    except sr.WaitTimeoutError:
+                        # This is normal, just continue
+                        logger.debug("No speech detected in timeout period")
+                        # Explicitly check the stop flag here
+                        if self.should_stop:
+                            logger.info("Stop flag detected in timeout handler, exiting loop")
+                            break
+                        continue
+                    except Exception as e:
+                        if self.should_stop:
+                            # We're shutting down, so this is expected
+                            logger.info("Stop flag detected in exception handler, exiting loop")
+                            break
+                        
+                        logger.error(f"Error in listening thread: {e}")
+                        logger.error(traceback.format_exc())
+                        print(f"❌ Error while listening: {str(e)}")
+                        
+                        # Small delay to prevent tight loop on error
+                        time.sleep(0.1)
+        except Exception as e:
+            logger.error(f"Error in background thread: {e}")
+            logger.error(traceback.format_exc())
+            print(f"❌ Critical error in listening thread: {str(e)}")
+                    
+        logger.info("Background listening thread stopped")
+        print("🛑 Microphone listening stopped")
+    
+    def _speech_callback(self, recognizer, audio):
+        """Callback function for processing audio"""
+        try:
+            # Check if we should stop
+            if self.should_stop:
+                logger.info("Stop flag detected in speech callback, skipping processing")
+                return
+                
             # Try to recognize the speech
             self.recognition_attempts += 1
             logger.debug(f"Attempting speech recognition (attempt {self.recognition_attempts})...")
+            print("🧠 Recognizing speech...")
             
             start_time = time.time()
-            text = self.recognizer.recognize_google(audio)
+            text = recognizer.recognize_google(audio)
             duration = time.time() - start_time
             
             self.recognition_successes += 1
             logger.info(f"Speech recognized in {duration:.2f}s: '{text}'")
+            print(f"✓ Recognized: \"{text}\" ({duration:.1f}s)")
             
             # Update debug info
             self.last_recognition_time = time.time()
@@ -287,6 +185,7 @@ class AudioManager:
                 logger.debug(f"Checking for wake word '{self.wake_word}' in '{text}'")
                 if self._check_wake_word(text):
                     logger.info(f"Wake word detected in: '{text}'")
+                    print(f"🔔 Wake word detected!")
                     self.in_conversation = True
                     if self.on_speech_detected:
                         logger.info("Calling wake word callback")
@@ -294,11 +193,12 @@ class AudioManager:
                     return
                 else:
                     logger.debug("Wake word not detected")
+                    print("🔕 Wake word not detected, continuing to listen...")
             
             # Check for interrupt word
             if self.interrupt_word and self.interrupt_word in text.lower():
                 logger.info(f"Interrupt word detected in: '{text}'")
-                self.send_interrupt_signal()
+                print(f"🛑 Interrupt word detected!")
                 if self.on_speech_detected:
                     logger.info("Calling interrupt callback")
                     self.on_speech_detected("interrupt", text)
@@ -314,16 +214,105 @@ class AudioManager:
                     logger.warning("No speech recognized callback registered")
             else:
                 logger.debug(f"Ignoring speech (not in conversation mode): '{text}'")
+                print("💤 Not in conversation mode - say the wake word to activate")
             
         except sr.UnknownValueError:
             # This is normal, just continue
             logger.debug("Speech recognition could not understand audio")
+            print("❓ Couldn't understand audio")
             pass
         except sr.RequestError as e:
             logger.error(f"Google Speech Recognition service error: {e}")
+            print(f"⚠️ Speech recognition service error: {str(e)}")
         except Exception as e:
             logger.error(f"Error processing audio: {e}")
             logger.error(traceback.format_exc())
+            print(f"❌ Error processing audio: {str(e)}")
+        
+    def start(self, wake_word=None, interrupt_word=None):
+        """Start the background listening"""
+        if self.listening_thread and self.listening_thread.is_alive():
+            logger.warning("AudioManager is already running")
+            return
+            
+        self.wake_word = wake_word.lower() if wake_word else None
+        self.interrupt_word = interrupt_word.lower() if interrupt_word else None
+        logger.info(f"Starting AudioManager with wake_word='{self.wake_word}', interrupt_word='{self.interrupt_word}'")
+        print(f"🎤 Starting speech recognition with wake word: '{self.wake_word}'")
+        
+        try:
+            # Initialize microphone
+            if self.mic_index is not None:
+                logger.info(f"Opening microphone with index {self.mic_index}")
+                try:
+                    self.microphone = sr.Microphone(device_index=self.mic_index)
+                except Exception as e:
+                    logger.error(f"Failed to open microphone with index {self.mic_index}: {e}")
+                    logger.info("Falling back to default microphone")
+                    print(f"⚠️ Failed to open microphone {self.mic_index}, falling back to default")
+                    self.microphone = sr.Microphone()
+            else:
+                logger.info("Opening default microphone")
+                self.microphone = sr.Microphone()
+            
+            # Reset stop flag
+            self.should_stop = False
+            
+            # Start background listening thread
+            logger.info("Starting background listening thread...")
+            self.listening_thread = threading.Thread(
+                target=self._background_listening_thread,
+                daemon=True
+            )
+            self.listening_thread.start()
+            
+            logger.info("AudioManager started successfully")
+            print("✅ Speech recognition started successfully")
+            
+        except Exception as e:
+            logger.error(f"Error starting AudioManager: {e}")
+            logger.error(traceback.format_exc())
+            print(f"❌ Failed to start speech recognition: {str(e)}")
+            raise
+    
+    def stop(self):
+        """Stop the background listening"""
+        logger.info("Stopping AudioManager...")
+        print("🛑 Stopping speech recognition...")
+        
+        if not self.listening_thread or not self.listening_thread.is_alive():
+            logger.info("No active listening thread to stop")
+            return
+            
+        # Signal thread to stop
+        self.should_stop = True
+        logger.info("Set should_stop flag to True")
+        
+        # Wait for thread to terminate
+        logger.info("Waiting for listening thread to stop...")
+        self.listening_thread.join(timeout=2)
+        
+        if self.listening_thread.is_alive():
+            logger.warning("Listening thread did not stop within timeout, continuing anyway")
+            print("⚠️ Listening thread did not stop cleanly (timeout)")
+        else:
+            logger.info("Listening thread stopped successfully")
+            print("✅ Listening thread stopped successfully")
+            
+        logger.info("AudioManager stopped")
+        
+    def set_conversation_mode(self, enabled):
+        """Set whether we're in conversation mode"""
+        self.in_conversation = enabled
+        logger.info(f"Conversation mode: {enabled}")
+        if enabled:
+            print("🎯 Conversation mode enabled - listening for commands")
+        else:
+            print("💤 Conversation mode disabled - waiting for wake word")
+        
+    def is_in_conversation(self):
+        """Check if we're in conversation mode"""
+        return self.in_conversation
     
     def _check_wake_word(self, text):
         """Check if the wake word is in the text"""
@@ -347,14 +336,11 @@ class AudioManager:
     def get_debug_info(self):
         """Get debug information about the audio manager"""
         return {
-            "running": self.running,
+            "running": self.listening_thread is not None and self.listening_thread.is_alive(),
             "in_conversation": self.in_conversation,
             "last_recognition_time": self.last_recognition_time,
             "recognition_count": self.recognition_count,
             "energy_threshold": self.recognizer.energy_threshold,
-            "interrupt_signaled": self.is_interrupt_signaled(),
-            "listen_attempts": self.listen_attempts,
-            "listen_successes": self.listen_successes,
             "recognition_attempts": self.recognition_attempts,
             "recognition_successes": self.recognition_successes
         } 
