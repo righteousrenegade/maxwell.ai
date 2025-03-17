@@ -7,7 +7,10 @@ import ollama
 from utils import setup_logger
 import logging
 
-logger = setup_logger()
+# Get the logger instance
+logger = logging.getLogger("maxwell")
+if not logger.handlers:
+    logger = setup_logger()
 
 class CommandExecutor:
     def __init__(self, assistant):

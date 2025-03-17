@@ -11,18 +11,12 @@ import re
 import json
 import logging
 import requests
+from utils import setup_logger
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
-    handlers=[
-        logging.FileHandler("assistant.log"),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+# Get the logger instance
+logger = logging.getLogger("maxwell")
+if not logger.handlers:
+    logger = setup_logger()
 
 # Check if the Ollama Python client is available
 try:

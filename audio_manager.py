@@ -7,8 +7,12 @@ import logging
 import os
 import traceback
 import sys
+from utils import setup_logger
 
+# Get the logger instance
 logger = logging.getLogger("maxwell")
+if not logger.handlers:
+    logger = setup_logger()
 
 class AudioManager:
     """

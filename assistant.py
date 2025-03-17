@@ -12,8 +12,12 @@ from speech import TextToSpeech
 from commands import CommandExecutor
 from utils import setup_logger, download_models
 from config import Config
+import random
 
-logger = setup_logger()
+# Setup logger only once with a specific name to avoid duplicates
+logger = logging.getLogger("maxwell")
+if not logger.handlers:  # Only setup if not already configured
+    logger = setup_logger()
 
 def list_microphones():
     """List all available microphones"""

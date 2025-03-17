@@ -9,22 +9,26 @@ import io
 def setup_logger():
     """Set up and return a logger for the application."""
     logger = logging.getLogger("maxwell")
-    logger.setLevel(logging.INFO)
     
-    # Create console handler
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setLevel(logging.INFO)
-    
-    # Create formatter
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    handler.setFormatter(formatter)
-    
-    # Add handler to logger
-    logger.addHandler(handler)
+    # Only add handlers if they don't exist already
+    if not logger.handlers:
+        logger.setLevel(logging.INFO)
+        
+        # Create console handler
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setLevel(logging.INFO)
+        
+        # Create formatter
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+        
+        # Add handler to logger
+        logger.addHandler(handler)
+        
+        # Prevent propagation to the root logger to avoid duplicate logs
+        logger.propagate = False
     
     return logger
-
-logger = setup_logger()
 
 def download_file(url, destination):
     """Download a file with progress bar."""
@@ -44,6 +48,11 @@ def download_file(url, destination):
 
 def download_and_extract_zip(url, destination_dir):
     """Download a zip file and extract it."""
+    # Get the logger instance
+    logger = logging.getLogger("maxwell")
+    if not logger.handlers:
+        logger = setup_logger()
+        
     logger.info(f"Downloading from {url}...")
     response = requests.get(url, stream=True)
     total_size = int(response.headers.get('content-length', 0))
@@ -54,6 +63,11 @@ def download_and_extract_zip(url, destination_dir):
 
 def download_models(offline_mode=False):
     """Download required models if they don't exist."""
+    # Get the logger instance
+    logger = logging.getLogger("maxwell")
+    if not logger.handlers:
+        logger = setup_logger()
+        
     # Create models directory
     models_dir = os.path.join(os.path.expanduser("~"), ".maxwell")
     os.makedirs(models_dir, exist_ok=True)

@@ -7,8 +7,12 @@ import soundfile as sf
 import numpy as np
 from kokoro_onnx import Kokoro
 from utils import setup_logger
+import logging
 
-logger = setup_logger()
+# Get the logger instance
+logger = logging.getLogger("maxwell")
+if not logger.handlers:
+    logger = setup_logger()
 
 class TextToSpeech:
     def __init__(self, voice="bm_lewis", speed=1.25):

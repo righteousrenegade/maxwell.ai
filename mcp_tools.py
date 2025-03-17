@@ -3,7 +3,10 @@ import logging
 from utils import setup_logger
 import json
 
-logger = setup_logger()
+# Get the logger instance
+logger = logging.getLogger("maxwell")
+if not logger.handlers:
+    logger = setup_logger()
 
 class Tool:
     def __init__(self, name, func, description):
