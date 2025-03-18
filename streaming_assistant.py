@@ -15,11 +15,21 @@ import tempfile
 import winsound
 import platform
 import ollama
-from speech import TextToSpeech
+from speech import TextToSpeech, DummyTTS
 from commands import CommandExecutor
 from utils import setup_logger, download_models
 from config import Config
 import random
+import json
+import socket
+import struct
+import re
+from dataclasses import dataclass
+from typing import List, Dict, Any, Callable, Optional
+from key_handler import KeyboardHandler
+
+# Version
+__version__ = "1.0.0"
 
 # Import MCP tools if available
 try:
@@ -595,50 +605,54 @@ class StreamingMaxwell:
         self.cleaned_up = False
         self.should_stop = False
         
+        # Initialize audio manager and mcp provider
+        self.audio_manager = None
+        self.mcp_tool_provider = None
+        self.tool_provider_started = False
+        
+        # Set wake and interrupt words
+        self.wake_word = config.get('wake_word', 'maxwell').lower()
+        self.interrupt_word = config.get('interrupt_word', 'stop talking').lower()
+        
         # Initialize components
         logger.info("Initializing Text-to-Speech...")
-        self.tts = TextToSpeech(voice=config.voice, speed=config.speed)
+        # Use system TTS by default (or pyttsx3 if specified)
+        tts_provider = config.get('tts_provider', 'kokoro')
+        tts_voice = config.get('voice')
+        tts_speed = config.get('speed', 1.0)
         
-        # Initialize AudioManager
-        logger.info("Initializing StreamingAudioManager...")
-        self.audio_manager = StreamingAudioManager(
-            mic_index=config.mic_index, 
-            energy_threshold=config.energy_threshold
-        )
+        if tts_provider == 'none':
+            # Dummy TTS that doesn't do anything
+            logger.info("TTS disabled by configuration (tts_provider=none)")
+            self.tts = DummyTTS()
+        else:
+            # System TTS (platform specific)
+            self.tts = TextToSpeech(voice=tts_voice, speed=tts_speed, config=config)
         
-        # Set callbacks
-        self.audio_manager.on_speech_detected = self._on_speech_detected
-        self.audio_manager.on_speech_recognized = self._on_speech_recognized
+        # Initialize keyboard handler for space bar interruption
+        logger.info("Initializing keyboard handler...")
+        self.keyboard_handler = KeyboardHandler(self.tts)
         
-        # Speech recognition state
-        self.wake_word = config.wake_word.lower()
-        self.interrupt_word = config.interrupt_word.lower()
-        
-        logger.info("Initializing Command Executor...")
-        self.command_executor = CommandExecutor(self)
-        
-        # Initialize Ollama client for direct LLM access
-        logger.info(f"Initializing Ollama client (host: {config.ollama_host}:{config.ollama_port})...")
-        try:
-            # Command executor will handle the Ollama client initialization
-            pass
-        except Exception as e:
-            logger.error(f"Error initializing Ollama client: {e}")
-            logger.error(traceback.format_exc())
-            print(f"⚠️ Warning: Failed to initialize Ollama client: {e}")
-        
-        # Initialize MCP Tools if enabled
-        self.mcp_tool_provider = None
-        if config.use_mcp and HAS_MCP_TOOLS:
-            logger.info(f"Initializing MCP Tool Provider (port: {config.mcp_port})...")
+        # MCP Tool Provider setup
+        self.enable_mcp = config.get('use_mcp', True)
+        if self.enable_mcp and HAS_MCP_TOOLS:
+            logger.info("Initializing MCP Tool Provider...")
             self.mcp_tool_provider = MCPToolProvider(self)
-            self.mcp_tool_provider.start_server()
+            self.tool_provider_started = False
+        else:
+            if self.enable_mcp:
+                logger.warning("MCP tools requested but not available")
+            self.mcp_tool_provider = None
+        
+        # Initialize Command Executor (will be set after initialization)
+        logger.info("Initializing Command Executor...")
+        self.command_executor = None
         
         # Setup signal handlers
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
         
-        logger.info(f"StreamingMaxwell initialized with wake word: '{config.wake_word}'")
+        logger.info(f"StreamingMaxwell initialized with wake word: '{self.wake_word}'")
         
     def _on_speech_detected(self, event_type, text):
         """Callback for speech detection events"""
@@ -680,18 +694,26 @@ class StreamingMaxwell:
     def cleanup(self):
         """Clean up resources"""
         logger.info("Cleaning up resources...")
+        
         # Only clean up once
         if hasattr(self, 'cleaned_up') and self.cleaned_up:
             logger.info("Already cleaned up, skipping...")
             return
             
         try:
+            # Stop the keyboard handler
+            if hasattr(self, 'keyboard_handler'):
+                logger.info("Stopping keyboard handler...")
+                self.keyboard_handler.stop()
+            
             # Clean up TTS
             if hasattr(self, 'tts'):
+                logger.info("Cleaning up TTS...")
                 self.tts.cleanup()
                 
             # Clean up AudioManager
-            if hasattr(self, 'audio_manager'):
+            if hasattr(self, 'audio_manager') and self.audio_manager:
+                logger.info("Stopping audio manager...")
                 self.audio_manager.stop()
             
             # Clean up MCP Tools if enabled
@@ -729,8 +751,12 @@ class StreamingMaxwell:
             # Add a small delay to ensure audio processing is fully paused
             time.sleep(0.2)
                 
-            # Use direct audio playback - will be stopped by global keyboard interrupt handler
+            # Use direct audio playback - will be stopped by space bar handler
             self.tts.speak(text)
+            
+            # Wait for speech to complete
+            while self.tts.is_speaking():
+                time.sleep(0.1)
             
             # Play a beep when Maxwell finishes speaking normally
             self._play_sound(frequency=850, duration=70)  # Medium-pitched beep
@@ -760,7 +786,7 @@ class StreamingMaxwell:
             logger.debug("Speaking completed, listening resumed")
     
     def handle_query(self, query):
-        """Handle a user query"""
+        """Handle a user query using MCP tools when possible"""
         if not query:
             logger.info("Empty query, ignoring")
             return
@@ -776,395 +802,278 @@ class StreamingMaxwell:
             print("🔴 Conversation ended. Say the wake word to start again.")
             return
         
-        # Special handling for "execute" commands - ensure they're processed as commands
-        if query.lower().startswith("execute "):
-            try:
-                logger.info("Processing explicit execute command - BYPASS LLM")
-                print("🛠️ Processing as direct command...")
-                response = self.command_executor.execute_command(query[8:].strip())
+        # Special handling for "execute" commands
+        query_lower = query.lower()
+        if query_lower.startswith("execute "):
+            # Extract the command part
+            command_text = query[8:].strip()
+            logger.info(f"Execute command detected: '{command_text}'")
+            
+            # Check for "execute search" pattern
+            if command_text.lower().startswith("search "):
+                search_term = command_text[7:].strip()
+                logger.info(f"Execute search command detected: '{search_term}'")
+                
+                # Use MCP tools for search if available
+                if self.enable_mcp and self.mcp_tool_provider:
+                    logger.info(f"Using MCP search_web tool for: '{search_term}'")
+                    print(f"🔍 Searching for: '{search_term}'")
+                    response = self.mcp_tool_provider.execute_tool("search_web", query=search_term)
+                    if response:
+                        self.speak(response)
+                    return
+        
+        # MCP tools integration - check if tools are available
+        if self.enable_mcp and self.mcp_tool_provider:
+            # Start the tool provider if not already started
+            if not self.tool_provider_started:
+                logger.info("Starting MCP tool provider...")
+                self.mcp_tool_provider.start_server()
+                self.tool_provider_started = True
+                
+                # Register MCP tools with command executor
+                if self.command_executor:
+                    logger.info("Registering MCP tools with command executor")
+                    self.command_executor._register_mcp_tools()
+                
+            # Get available tools
+            available_tools = self.mcp_tool_provider.get_tool_descriptions()
+            logger.debug(f"Available tools: {available_tools}")
+            
+            # Direct mapping for common commands to MCP tools
+            command_to_tool = {
+                "time": {"tool": "get_time"},
+                "what time is it": {"tool": "get_time"},
+                "what's the time": {"tool": "get_time"},
+                "tell me the time": {"tool": "get_time"},
+                
+                "date": {"tool": "get_date"},
+                "what day is it": {"tool": "get_date"},
+                "what's the date": {"tool": "get_date"},
+                "tell me the date": {"tool": "get_date"},
+                
+                "joke": {"tool": "tell_joke"},
+                "tell me a joke": {"tool": "tell_joke"},
+                
+                "weather": {"tool": "get_weather"},
+                "what's the weather": {"tool": "get_weather"}
+            }
+            
+            # Check for direct matches from query to tool
+            for command, tool_info in command_to_tool.items():
+                if command in query_lower:
+                    tool_name = tool_info["tool"]
+                    logger.info(f"Executing MCP tool: {tool_name}")
+                    print(f"🛠️ Processing with MCP tool: '{tool_name}'")
+                    response = self.mcp_tool_provider.execute_tool(tool_name)
+                    if response:
+                        self.speak(response)
+                    return
+            
+            # Handle search commands - improved detection
+            search_keywords = ["search", "search for", "look up", "find", "find information about"]
+            is_search_command = False
+            search_term = ""
+            
+            for keyword in search_keywords:
+                if query_lower.startswith(keyword + " "):
+                    is_search_command = True
+                    search_term = query_lower.replace(keyword, "", 1).strip()
+                    break
+            
+            if is_search_command and search_term:
+                logger.info(f"Search command detected - search term: '{search_term}'")
+                print(f"🔍 Processing search for: '{search_term}'")
+                response = self.mcp_tool_provider.execute_tool("search_web", query=search_term)
                 if response:
                     self.speak(response)
                 return
-            except Exception as e:
-                logger.error(f"Error processing execute command: {e}")
-                logger.error(traceback.format_exc())
-                self.speak(f"I'm sorry, I encountered an error processing your command: {str(e)}")
-                return
-        
-        # Handle common search phrases
-        if query.lower().startswith("search ") or query.lower().startswith("search for ") or \
-           query.lower().startswith("look up ") or query.lower().startswith("find "):
-            logger.info("Search command detected - BYPASS LLM")
-            print("🔍 Processing as search command...")
-            search_term = query.lower().replace("search for ", "").replace("search ", "").replace("look up ", "").replace("find ", "")
-            response = self.command_executor.search(search_term)
-            if response:
-                self.speak(response)
-            return
+                
+            # Weather with location
+            weather_patterns = ["weather in ", "weather for ", "what's the weather in ", "what is the weather in "]
+            for pattern in weather_patterns:
+                if pattern in query_lower:
+                    location = query_lower.split(pattern, 1)[1].strip()
+                    logger.info(f"Weather command detected with location: {location}")
+                    print(f"🌤️ Getting weather for {location}...")
+                    response = self.mcp_tool_provider.execute_tool("get_weather", location=location)
+                    if response:
+                        self.speak(response)
+                    return
             
-        # Check if this is a direct command first
-        parts = query.split(maxsplit=1)
-        command = parts[0].lower() if parts else ""
-        
-        if command in self.command_executor.available_commands:
+            # Set reminder
+            if "remind me" in query_lower or "set a reminder" in query_lower:
+                logger.info("Reminder command detected")
+                reminder_text = query_lower.replace("remind me", "").replace("set a reminder", "").replace("to", "", 1).strip()
+                response = self.mcp_tool_provider.execute_tool("set_reminder", text=reminder_text)
+                if response:
+                    self.speak(response)
+                return
+                
+            # Set timer
+            timer_patterns = ["set a timer for ", "timer for ", "set timer for "]
+            for pattern in timer_patterns:
+                if pattern in query_lower:
+                    duration = query_lower.split(pattern, 1)[1].strip()
+                    logger.info(f"Timer command detected: {duration}")
+                    response = self.mcp_tool_provider.execute_tool("set_timer", duration=duration)
+                    if response:
+                        self.speak(response)
+                    return
+            
+            # Play music
+            if "play music" in query_lower or "play some music" in query_lower:
+                logger.info("Play music command detected")
+                response = self.mcp_tool_provider.execute_tool("play_music")
+                if response:
+                    self.speak(response)
+                return
+                
+            # Play specific song or artist
+            if "play " in query_lower:
+                # Extract what to play
+                play_request = query_lower.replace("play ", "", 1).strip()
+                logger.info(f"Play specific music: {play_request}")
+                
+                # Check if it's a song by an artist
+                if " by " in play_request:
+                    song, artist = play_request.split(" by ", 1)
+                    response = self.mcp_tool_provider.execute_tool("play_music", song=song, artist=artist)
+                else:
+                    # Could be a song name or artist name
+                    response = self.mcp_tool_provider.execute_tool("play_music", song=play_request)
+                
+                if response:
+                    self.speak(response)
+                return
+                
+        # If we get here and have a command executor, fall back to it
+        if hasattr(self, 'command_executor') and self.command_executor:
+            # Use the LLM/command executor as fallback
             try:
-                logger.info(f"Direct command '{command}' detected - BYPASS LLM")
-                print(f"🛠️ Processing as direct '{command}' command...")
+                logger.info("No direct MCP tool match - using command executor")
+                print("💭 Processing with command executor...")
                 response = self.command_executor.execute(query)
                 if response:
                     self.speak(response)
-                return
             except Exception as e:
-                logger.error(f"Error executing direct command: {e}")
-                self.speak(f"I'm sorry, I encountered an error executing that command: {str(e)}")
-                return
-        
-        # Check for other common phrases that map to commands
-        common_phrases = {
-            "what time is it": "time",
-            "what's the time": "time",
-            "tell me the time": "time",
-            "what day is it": "date",
-            "what's the date": "date",
-            "tell me the date": "date",
-            "tell me a joke": "joke"
-        }
-        
-        for phrase, cmd in common_phrases.items():
-            if query.lower().startswith(phrase):
-                logger.info(f"Common phrase '{phrase}' detected - BYPASS LLM - using command '{cmd}'")
-                print(f"🛠️ Processing as {cmd} command...")
-                response = self.command_executor.execute_command(cmd)
-                if response:
-                    self.speak(response)
-                return
-                
-        # Process through the normal flow (which might use Ollama or commands)
-        try:
-            # Check if Ollama is available before trying to process the query
-            if hasattr(self.command_executor, 'ollama_available') and not self.command_executor.ollama_available:
-                # Try to reconnect to Ollama
-                reconnected = self.command_executor.check_ollama_connection(force=True)
-                if not reconnected:
-                    logger.warning("LLM service unavailable, suggesting direct commands instead")
-                    self.speak("I'm sorry, the language model service is not available right now. You can use specific commands like 'execute time', 'execute weather', or check the connection with 'execute check ollama'.")
-                    return
-            
-            logger.info("No direct command match - trying LLM or command executor")
-            print("💭 Processing normally...")
-            # Execute the command/query
-            response = self.command_executor.execute(query)
-            
-            # Speak the response if there is one
-            if response:
-                self.speak(response)
-                
-        except Exception as e:
-            logger.error(f"Error handling query: {e}")
-            logger.error(traceback.format_exc())
-            error_msg = str(e)
-            
-            # Provide more helpful error messages based on error type
-            if "connect" in error_msg.lower() or "connection" in error_msg.lower() or "refused" in error_msg.lower():
-                self.speak("I'm sorry, I couldn't connect to the language model service. You can use specific commands like 'execute time' or check the connection with 'execute check ollama'.")
-            else:
-                self.speak("I'm sorry, I encountered an error processing your request. You can try using direct commands or check if the language model service is available.")
-    
-    def execute_tool(self, tool_name, **kwargs):
-        """Execute a tool by name - used by the command executor"""
-        if not self.config.use_mcp or not self.mcp_tool_provider:
-            logger.warning(f"Tool execution requested but MCP is not enabled: {tool_name}")
-            return f"I'm sorry, tool execution is not available."
-            
-        logger.info(f"Executing tool: {tool_name} with args: {kwargs}")
-        result = self.mcp_tool_provider.execute_tool(tool_name, **kwargs)
-        logger.info(f"Tool execution result: {result}")
-        return result
-        
-    def get_available_tools(self):
-        """Get a list of available tools - used by the command executor"""
-        if not self.config.use_mcp or not self.mcp_tool_provider:
-            return {}
-            
-        return self.mcp_tool_provider.get_tool_descriptions()
+                logger.error(f"Error handling query with command executor: {e}")
+                self.speak("I'm sorry, I encountered an error processing your request.")
+        else:
+            # No command executor available
+            logger.error("No command executor or MCP tools available to handle the query")
+            self.speak("I'm sorry, I'm not able to process that request right now.")
     
     def run(self):
-        logger.info("Maxwell is running. Say the wake word to begin.")
+        """Main loop for the assistant"""
+        logger.info("StreamingMaxwell is running")
+        print("\n🤖 Maxwell Assistant is starting up...")
         
-        # Check microphone status before starting
-        mic_status, message = self.audio_manager.check_microphone_status()
-        if not mic_status:
-            logger.warning(f"Microphone check warning: {message}")
-            print(f"⚠️ Microphone check warning: {message}")
-        else:
-            logger.info(f"Microphone check passed: {message}")
+        try:
+            # Start the keyboard handler
+            self.keyboard_handler.start(self.tts)
+            logger.info("Keyboard handler started - SPACE key will interrupt speech")
             
-        # Enable audio debug mode if debug logging is enabled
-        if logger.level == logging.DEBUG:
-            self.audio_manager.set_debug_mode(True)
-            logger.debug("Audio debug mode enabled")
-        
-        # Display LLM provider information
-        llm_provider = self.command_executor.llm_provider
-        logger.info(f"Using LLM provider: {llm_provider}")
-        
-        if llm_provider == "ollama":
-            # Check if Ollama is available
-            ollama_available = self.command_executor.check_ollama_connection(force=True, detailed=True)
-            if ollama_available:
-                logger.info(f"✅ Ollama LLM service is available with model: {self.config.model}")
-                print(f"🧠 Ollama LLM available with model: {self.config.model}")
-                print(f"   Host: {self.config.ollama_host}:{self.config.ollama_port}")
+            # Initialize the command executor if not already done
+            if not self.command_executor:
+                logger.info("Initializing command executor...")
+                from commands import CommandExecutor
+                self.command_executor = CommandExecutor(self, self.config)
+                logger.info("Command executor initialized")
+            
+            # Start MCP tool provider if enabled
+            if self.enable_mcp and self.mcp_tool_provider:
+                logger.info("Starting MCP tool provider...")
+                self.mcp_tool_provider.start_server()
+                self.tool_provider_started = True
+                print(f"🔧 MCP tools integration enabled")
+                
+                # Log available tools
+                available_tools = self.mcp_tool_provider.get_tool_descriptions()
+                tool_names = list(available_tools.keys())
+                logger.info(f"Available MCP tools: {', '.join(tool_names)}")
+                
+                # Register MCP tools with command executor
+                if self.command_executor:
+                    logger.info("Registering MCP tools with command executor")
+                    self.command_executor._register_mcp_tools()
+            
+            # Initialize the LLM provider based on configuration
+            llm_provider = getattr(self.config, 'llm_provider', 'none').lower()
+            
+            # Print LLM provider information
+            if llm_provider == 'openai':
+                print(f"🧠 Using OpenAI API ({self.config.get('openai_model', 'unknown model')})")
+                logger.info(f"Using OpenAI API with model {self.config.get('openai_model', 'unknown')}")
+                print(f"   API URL: {self.config.get('openai_base_url', 'unknown')}")
+            elif llm_provider == 'ollama':
+                model = getattr(self.config, 'model', 'unknown')
+                base_url = getattr(self.config, 'ollama_base_url', 'unknown')
+                print(f"🧠 Using Ollama ({model})")
+                logger.info(f"Using Ollama with model {model} at {base_url}")
+            elif llm_provider == 'none':
+                print("🧠 No LLM provider configured")
+                logger.info("No LLM provider configured")
             else:
-                logger.warning("❌ Ollama LLM service is not available, only direct commands will work")
-                self._display_command_only_message("Ollama", "check ollama")
-        
-        elif llm_provider == "openai":
-            # Check if OpenAI is available
-            openai_available = self.command_executor.check_openai_connection(force=True, detailed=True)
-            if openai_available:
-                logger.info(f"✅ OpenAI API is available with model: {self.config.openai_model}")
-                print(f"🧠 OpenAI API available with model: {self.config.openai_model}")
-                print(f"   Base URL: {self.config.openai_base_url}")
-            else:
-                logger.warning("❌ OpenAI API is not available, only direct commands will work")
-                self._display_command_only_message("OpenAI", "check openai")
+                print(f"🧠 Using {llm_provider} provider")
+                logger.info(f"Using provider: {llm_provider}")
+            
+            # Ensure the wake word is set
+            if not self.wake_word and hasattr(self.config, 'wake_word'):
+                self.wake_word = self.config.wake_word
                 
-                # Offer to switch to Ollama if available
-                print("\n" + "="*60)
-                print("🔄 PROVIDER SWITCHING OPTIONS:")
-                print("OpenAI connection failed. You have these options:")
-                print("1. Continue with OpenAI provider (commands only, no LLM)")
-                print("2. Try using Ollama as fallback")
-                print("3. Exit and restart with different options")
-                print("="*60)
+            if not self.wake_word:
+                self.wake_word = "maxwell"  # Default wake word
                 
-                try:
-                    choice = input("Enter your choice (1-3): ").strip()
-                    
-                    if choice == "2":
-                        # Try to switch to Ollama
-                        switched = self.command_executor.try_switch_to_ollama()
-                        if switched:
-                            # Update config to match new provider
-                            self.config.llm_provider = "ollama"
-                            print("✅ Successfully switched to Ollama provider")
-                            # Update provider variables
-                            llm_provider = "ollama"
-                        else:
-                            print("❌ Could not switch to Ollama provider")
-                            print("Continuing with OpenAI in command-only mode")
-                    elif choice == "3":
-                        print("Exiting. Restart with different options.")
-                        print("Example: --llm-provider=ollama")
-                        self.cleanup()
-                        sys.exit(0)
-                    else:
-                        print("Continuing with OpenAI in command-only mode")
-                except KeyboardInterrupt:
-                    print("\nOperation cancelled by user. Continuing with current settings.")
-                except Exception as e:
-                    logger.error(f"Error during provider switch: {e}")
-                    print(f"Error: {e}")
-                    print("Continuing with current settings.")
-        
-        else:
-            # Unknown provider
-            logger.warning(f"❌ Unknown LLM provider: {llm_provider}, only direct commands will work")
-            self._display_command_only_message(llm_provider, "")
-        
-        # Start the audio manager
-        self.audio_manager.start(wake_word=self.wake_word, interrupt_word=self.interrupt_word)
-        
-        # Print instructions for interrupting speech
-        print("\n" + "="*60)
-        print("💡 KEYBOARD SHORTCUTS:")
-        print("  • Press SPACE while Maxwell is speaking to interrupt speech")
-        print("  • Press Ctrl+C twice quickly to exit the program")
-        print("="*60 + "\n")
-        
-        # Add more detailed OpenAI connection checks if that's the selected provider
-        if llm_provider == "openai":
-            print("\n" + "="*60)
-            print(f"🔍 CHECKING OPENAI CONNECTION DETAILS:")
-            print(f"  • Provider:    {self.config.llm_provider}")
-            print(f"  • Base URL:    {self.config.openai_base_url}")
-            print(f"  • Model:       {self.config.openai_model}")
-            print(f"  • API Key:     {'Set' if self.config.openai_api_key and self.config.openai_api_key != 'None' else 'NOT SET'}")
-            
-            # Check if API key is missing or set to literal "None"
-            if not self.config.openai_api_key or self.config.openai_api_key == "None":
-                print("\n⚠️ ERROR: OpenAI API key is not set or is set to 'None'")
-                print("Please provide a valid API key with --openai-api-key")
-                print("Example: --openai-api-key=sk-your-key-here")
+            # Initialize the audio manager if not already done
+            if not self.audio_manager:
+                mic_index = getattr(self.config, 'mic_index', None)
+                energy_threshold = getattr(self.config, 'energy_threshold', 300)
                 
-                # Try to see if we can switch to offline mode or Ollama
-                print("\n💡 SUGGESTION: Switch to Ollama provider or fix the API key")
-                print("Example: --llm-provider=ollama")
-                print("="*60 + "\n")
-            
-            # Check if base URL might be invalid
-            if "://" not in self.config.openai_base_url:
-                print("\n⚠️ WARNING: OpenAI base URL looks invalid (missing protocol)")
-                print(f"Current value: {self.config.openai_base_url}")
-                print("Should include http:// or https://")
-                print("Example: --openai-base-url=https://api.openai.com/v1")
-                print("="*60 + "\n")
-            
-            # If we detect localhost in the URL, check if port is open
-            if "localhost" in self.config.openai_base_url or "127.0.0.1" in self.config.openai_base_url:
-                import socket
-                host = "localhost"
-                # Try to extract port from URL
-                port = None
-                try:
-                    port_str = self.config.openai_base_url.split("://")[1].split(":")[1].split("/")[0]
-                    port = int(port_str)
-                except:
-                    print("\n⚠️ WARNING: Could not determine port from OpenAI base URL")
-                    print("If you're using a local server, make sure port is specified")
-                    print("Example: --openai-base-url=http://localhost:1234/v1")
-                    
-                if port:
-                    print(f"\n🔍 Checking if port {port} is open on {host}...")
-                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    s.settimeout(2)
-                    try:
-                        result = s.connect_ex((host, port))
-                        if result == 0:
-                            print(f"✅ Port {port} is open on {host}")
-                        else:
-                            print(f"❌ Port {port} is CLOSED on {host}")
-                            print(f"Make sure your local OpenAI API server is running on port {port}")
-                    except Exception as e:
-                        print(f"❌ Error checking port: {e}")
-                    finally:
-                        s.close()
-                        
-                print("="*60 + "\n")
-        
-        # Announce startup
-        self.speak(f"Hello, Maxwell here. Say '{self.wake_word}' to get my attention.")
-        
-        # Add a test mode option for immediate conversation
-        if self.config.test_mode or self.config.always_listen:
-            logger.info("Test mode or always-listen mode enabled. Entering conversation mode immediately.")
-            self.speak("I'm listening for commands.")
-            self.in_conversation = True
-            self.audio_manager.set_conversation_mode(True)
-        
-        # Keyboard mode - use keyboard input instead of microphone
-        if self.config.keyboard_mode:
-            logger.info("Keyboard mode enabled. Type your queries instead of speaking.")
-            self.speak("Keyboard mode enabled. Type your queries instead of speaking.")
-            
-            print("\n==== Keyboard Input Mode ====")
-            print(f"Type your queries or 'exit' to quit. Type '{self.wake_word}' to begin conversation.")
-            
-            # Initial state - waiting for wake word if not in test mode
-            if not self.config.test_mode and not self.config.always_listen:
-                keyboard_in_conversation = False
-                print(f"Waiting for wake word '{self.wake_word}'...")
-            else:
-                keyboard_in_conversation = True
-                print("Maxwell is listening for commands...")
+                self.audio_manager = StreamingAudioManager(
+                    mic_index=mic_index,
+                    energy_threshold=energy_threshold
+                )
                 
-            while True:
-                try:
-                    user_input = input("> ").strip()
-                    
-                    if user_input.lower() == 'exit':
-                        logger.info("User requested exit in keyboard mode")
-                        print("Exiting Maxwell...")
-                        self.stop()
-                        break
-                        
-                    if not keyboard_in_conversation:
-                        # Check for wake word when not in conversation
-                        if self.wake_word.lower() in user_input.lower():
-                            logger.info("Wake word detected in keyboard input")
-                            print(f"🔔 Wake word detected!")
-                            keyboard_in_conversation = True
-                            self.in_conversation = True
-                            self.audio_manager.set_conversation_mode(True)
-                            self.speak("I'm listening. How can I help?")
-                        else:
-                            print(f"Waiting for wake word '{self.wake_word}'...")
-                            continue
-                    else:
-                        # We're in conversation mode
-                        if "end conversation" in user_input.lower():
-                            logger.info("End conversation detected in keyboard input")
-                            keyboard_in_conversation = False
-                            self.in_conversation = False
-                            self.audio_manager.set_conversation_mode(False)
-                            self.speak("Ending conversation.")
-                            print(f"🔴 Conversation ended. Type '{self.wake_word}' to start again.")
-                        else:
-                            # Process the query
-                            logger.info(f"Processing keyboard input: {user_input}")
-                            self.handle_query(user_input)
-                            
-                except KeyboardInterrupt:
-                    # Check if we're speaking - if so, just interrupt the speech
-                    if self.speaking:
-                        logger.info("KeyboardInterrupt detected during speech in keyboard mode")
-                        self.tts.stop()
-                        print("\n🛑 Speech interrupted!")
-                        continue  # Continue the loop instead of exiting
-                    else:
-                        # If not speaking, exit the program
-                        logger.info("KeyboardInterrupt detected in keyboard mode, exiting")
-                        print("\nExiting Maxwell...")
-                        self.stop()
-                        break
-                except Exception as e:
-                    logger.error(f"Error in keyboard mode: {e}")
-                    logger.error(traceback.format_exc())
-                    print(f"Error: {str(e)}")
-        
-        else:
-            # Normal operation mode - wait for the audio processing thread
-            last_interrupt_time = 0  # For tracking double Ctrl+C
-            
-            try:
-                # Keep the main thread alive
-                while not self.should_stop:
-                    try:
-                        time.sleep(0.1)
-                    except KeyboardInterrupt:
-                        # Get current time
-                        current_time = time.time()
-                        
-                        # Check if we're speaking
-                        if self.speaking:
-                            # Interrupt speech but keep running
-                            logger.info("KeyboardInterrupt detected - stopping speech")
-                            self.tts.stop()
-                            print("\n🛑 Speech interrupted!")
-                            # Reset last interrupt time
-                            last_interrupt_time = current_time
-                        else:
-                            # Check if this is a double-press (within 1 second)
-                            if current_time - last_interrupt_time < 1.0:
-                                # Double Ctrl+C - exit the program
-                                logger.info("Double KeyboardInterrupt detected, stopping")
-                                print("\nDouble Ctrl+C detected! Stopping Maxwell...")
-                                self.stop()
-                                break
-                            else:
-                                # Single Ctrl+C - just note it and continue
-                                print("\nPress Ctrl+C again within 1 second to exit")
-                                last_interrupt_time = current_time
-                    
-            except Exception as e:
-                logger.error(f"Error in main thread: {e}")
-                logger.error(traceback.format_exc())
-                self.stop()
+                # Set callbacks
+                self.audio_manager.on_speech_detected = self._on_speech_detected
+                self.audio_manager.on_speech_recognized = self._on_speech_recognized
                 
-        logger.info("Maxwell has stopped")
-        print("Maxwell has stopped. Goodbye!")
+            # Start the audio manager
+            print(f"🎤 Listening for wake word: '{self.wake_word}'")
+            self.audio_manager.start(wake_word=self.wake_word, interrupt_word=self.interrupt_word)
             
+            # Announce startup
+            print("\n🚀 Maxwell is ready!")
+            self.speak(f"Hello, Maxwell here. Say '{self.wake_word}' to get my attention.")
+            
+            # Print some helpful info
+            print(f"🔊 Say '{self.wake_word}' followed by your query. For example:")
+            print(f"🗣️  '{self.wake_word}, what time is it?'")
+            print(f"🗣️  '{self.wake_word}, tell me a joke'")
+            print("")
+            print("⌨️  Press SPACE to interrupt speech")
+            print("⌨️  Press Ctrl+C to exit")
+            
+            # Main loop - just keep the process alive
+            while not self.should_stop:
+                time.sleep(0.1)
+                
+            return True
+            
+        except KeyboardInterrupt:
+            logger.info("Keyboard interrupt received, shutting down...")
+            print("\n👋 Shutting down by keyboard interrupt...")
+            self.cleanup()
+            
+        except Exception as e:
+            logger.error(f"Error in main loop: {e}")
+            logger.error(traceback.format_exc())
+            print(f"❌ Error: {e}")
+            self.cleanup()
+            
+        return False
+    
     def _play_listening_sound(self):
         """Play a sound to indicate we're listening"""
         try:
@@ -1208,9 +1117,21 @@ class StreamingMaxwell:
         print("\n" + "="*60)
         print(f"⚠️ COMMAND-ONLY MODE: {provider_name} LLM service is not available")
         print("="*60)
+        
+        # Get available commands
+        commands = []
+        if hasattr(self, 'command_executor') and self.command_executor:
+            try:
+                commands = sorted([cmd for cmd in self.command_executor.available_commands.keys() 
+                                if len(cmd.split()) == 1 and cmd not in ["what", "what's", "tell"]])
+            except Exception as e:
+                logger.error(f"Error getting available commands: {e}")
+                commands = ["time", "date", "weather", "help"]
+        else:
+            # Fallback to basic commands
+            commands = ["time", "date", "weather", "help"]
+            
         print("You can use these direct commands:")
-        commands = sorted([cmd for cmd in self.command_executor.available_commands.keys() 
-                         if len(cmd.split()) == 1 and cmd not in ["what", "what's", "tell"]])
         print(", ".join(commands))
         print("="*60 + "\n")
         print("💡 To use a command, say: 'execute [command]'")
@@ -1219,139 +1140,222 @@ class StreamingMaxwell:
             print(f"💡 To check connectivity, use 'execute {check_command}' command.")
 
 def main():
-    parser = argparse.ArgumentParser(description="Maxwell Voice Assistant (Streaming Edition)")
-    parser.add_argument("--wake-word", default="hello maxwell", help="Wake word to activate the assistant")
-    parser.add_argument("--interrupt-word", default="stop talking", help="Word to interrupt the assistant")
-    parser.add_argument("--voice", default="bm_lewis", help="Voice for text-to-speech")
-    parser.add_argument("--speed", default=1.25, type=float, help="Speech speed (1.0 is normal)")
-    parser.add_argument("--offline", action="store_true", help="Use offline speech recognition")
-    parser.add_argument("--continuous", action="store_true", help="Stay in conversation mode until explicitly ended")
-    parser.add_argument("--list-voices", action="store_true", help="List available TTS voices and exit")
+    """Main entry point for the streaming assistant"""
+    import argparse
+    import platform
+    import logging
+    import traceback  # Make sure traceback is imported
+    import json
+    import sys
     
-    # LLM provider options
-    llm_group = parser.add_argument_group('LLM Provider Options')
-    llm_group.add_argument("--llm-provider", default="openai", choices=["ollama", "openai"], 
-                           help="LLM provider to use (ollama or openai)")
-    
-    # Ollama options
-    ollama_group = parser.add_argument_group('Ollama Options')
-    ollama_group.add_argument("--model", default="dolphin-llama3:8b-v2.9-q4_0", help="Ollama model to use")
-    ollama_group.add_argument("--ollama-host", default="localhost", help="Ollama host address")
-    ollama_group.add_argument("--ollama-port", default=11434, type=int, help="Ollama port")
-    
-    # OpenAI options
-    openai_group = parser.add_argument_group('OpenAI Options')
-    openai_group.add_argument("--openai-api-key", default="n/a", help="OpenAI API key (optional for local APIs)")
-    openai_group.add_argument("--openai-base-url", default="http://localhost:1234/v1",
-                             help="OpenAI API base URL (can be a local server URL)")
-    openai_group.add_argument("--openai-model", default="gpt-3.5-turbo", 
-                             help="OpenAI model name")
-    openai_group.add_argument("--openai-system-prompt", 
-                             help="System prompt for OpenAI chat completions")
-    openai_group.add_argument("--openai-temperature", type=float, default=0.7,
-                             help="Temperature for OpenAI completions (0.0-2.0)")
-    openai_group.add_argument("--openai-max-tokens", type=int,
-                             help="Max tokens for OpenAI completions")
-    
-    # Other options
-    parser.add_argument("--test", action="store_true", help="Test mode - immediately enter conversation mode")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    parser.add_argument("--use-mcp", action="store_true", help="Enable MCP tools integration")
-    parser.add_argument("--mcp-port", default=8080, type=int, help="Port for MCP server")
-    parser.add_argument("--mic-index", type=int, help="Specific microphone index to use")
-    parser.add_argument("--keyboard-mode", action="store_true", help="Use keyboard input instead of microphone")
-    parser.add_argument("--always-listen", action="store_true", help="Always listen for commands without wake word")
-    parser.add_argument("--energy-threshold", type=int, default=300, help="Energy threshold for speech recognition (lower = more sensitive)")
-    parser.add_argument("--list-mics", action="store_true", help="List available microphones and exit")
-    parser.add_argument("--save-audio", action="store_true", help="Save audio files for debugging")
-    parser.add_argument("--mic-name", help="Specific microphone name to use (partial match)")
-    parser.add_argument("--sample-rate", type=int, help="Sample rate to use for microphone input")
-    
-    args = parser.parse_args()
-    
-    # Set debug logging if requested
-    if args.debug:
-        logger.setLevel(logging.DEBUG)
-        logger.debug("Debug logging enabled")
-    
-    # List voices if requested
-    if args.list_voices:
-        from speech import TextToSpeech
-        TextToSpeech.list_available_voices()
-        return
-        
-    # List microphones if requested
-    if args.list_mics:
-        list_microphones()
-        return
-        
-    # Download required models
-    download_models(offline_mode=args.offline)
-    
-    # If mic-name is specified, find the matching microphone index
-    if args.mic_name and not args.mic_index:
-        mics = list_microphones()
-        for i, mic_name in enumerate(mics):
-            if args.mic_name.lower() in mic_name.lower():
-                logger.info(f"Found microphone matching '{args.mic_name}': {i}: {mic_name}")
-                args.mic_index = i
-                break
-        else:
-            logger.warning(f"No microphone found matching '{args.mic_name}'")
-    
-    # Create config
-    config = Config(
-        wake_word=args.wake_word,
-        interrupt_word=args.interrupt_word,
-        voice=args.voice,
-        speed=args.speed,
-        offline_mode=args.offline,
-        continuous_conversation=args.continuous,
-        model=args.model,
-        ollama_host=args.ollama_host,
-        ollama_port=args.ollama_port,
-        test_mode=args.test,
-        use_mcp=args.use_mcp,
-        mcp_port=args.mcp_port,
-        keyboard_mode=args.keyboard_mode,
-        mic_index=args.mic_index,
-        always_listen=args.always_listen,
-        energy_threshold=args.energy_threshold,
-        save_audio=args.save_audio,
-        sample_rate=args.sample_rate,
-        # OpenAI options
-        llm_provider=args.llm_provider,
-        openai_api_key=args.openai_api_key,
-        openai_base_url=args.openai_base_url,
-        openai_model=args.openai_model,
-        openai_system_prompt=args.openai_system_prompt,
-        openai_temperature=args.openai_temperature,
-        openai_max_tokens=args.openai_max_tokens
-    )
-    
-    # Log the configuration
-    logger.info(f"Starting Maxwell (Streaming Edition) with configuration:")
-    for key, value in vars(config).items():
-        # Don't log API keys
-        if key == "openai_api_key" and value:
-            logger.info(f"  {key}: [REDACTED]")
-        else:
-            logger.info(f"  {key}: {value}")
-    
-    # Create and run assistant
-    assistant = StreamingMaxwell(config)
     try:
-        if config.use_mcp and HAS_MCP_TOOLS:
-            print(f"🔧 MCP tools integration enabled (port: {config.mcp_port})")
-        elif config.use_mcp and not HAS_MCP_TOOLS:
-            print("⚠️ MCP tools requested but not available")
+        # Parse command line arguments
+        parser = argparse.ArgumentParser(description="Streaming Audio Assistant")
+        
+        # Config options
+        parser.add_argument('--config', help="Path to YAML config file")
+        parser.add_argument('--env-file', help="Path to .env file")
+        
+        # Microphone options
+        parser.add_argument('--list-mics', action='store_true', help="List available microphones and exit")
+        parser.add_argument('--mic-index', type=int, help="Microphone index to use")
+        parser.add_argument('--energy-threshold', type=int, help="Energy level for mic to detect")
+        parser.add_argument('--record-path', help="Path to save recorded audio files")
+        parser.add_argument('--offline', action='store_true', help="Use offline speech recognition (Vosk)")
+        
+        # TTS options
+        parser.add_argument('--tts-provider', choices=['system', 'pyttsx3', 'none'], 
+                          help="TTS provider to use")
+        parser.add_argument('--voice', help="Voice to use for TTS")
+        parser.add_argument('--speed', type=float, help="Speed for TTS")
+        
+        # LLM provider options
+        parser.add_argument('--llm-provider', 
+                          choices=['openai', 'ollama', 'none'], 
+                          help="LLM provider to use")
+        
+        # OpenAI options
+        parser.add_argument('--openai-api-key', help="OpenAI API key")
+        parser.add_argument('--openai-base-url', help="OpenAI API base URL")
+        parser.add_argument('--openai-model', help="OpenAI model name to use")
+        
+        # Ollama options
+        parser.add_argument('--ollama-host', help="Ollama server host")
+        parser.add_argument('--ollama-port', type=int, help="Ollama server port")
+        parser.add_argument('--ollama-model', help="Ollama model to use")
+        
+        # Conversation options
+        parser.add_argument('--wake-word', help="Wake word to listen for")
+        parser.add_argument('--interrupt-word', help="Word to interrupt the assistant")
+        parser.add_argument('--no-convo', action='store_true', 
+                          help="Exit after handling one query")
+        parser.add_argument('--test-mode', action='store_true', 
+                          help="Immediately enter conversation mode for testing")
+        parser.add_argument('--keyboard-mode', action='store_true', 
+                          help="Use keyboard instead of microphone for input")
+        parser.add_argument('--always-listen', action='store_true', 
+                          help="Always listen mode - no wake word needed")
+                          
+        # MCP integration
+        parser.add_argument('--use-mcp', action='store_true', help="Use MCP tool provider integration")
+        parser.add_argument('--mcp-port', type=int, help="MCP API port")
+        
+        # Debug options
+        parser.add_argument('--verbose', '-v', action='store_true', help="Enable verbose output")
+        parser.add_argument('--debug', action='store_true', help="Enable debug mode")
+        
+        # Parse the arguments
+        args = parser.parse_args()
+        
+        # Handle microphone listing
+        if args.list_mics:
+            list_microphones()
+            return
             
-        assistant.run()
+        # Set up logging
+        log_level = logging.INFO
+        if args.verbose or args.debug:
+            log_level = logging.DEBUG
+            
+        # Configure logger
+        logger = setup_logger(log_level)
+        logger.info(f"Starting Maxwell assistant v{__version__}")
+        
+        # Log platform information
+        logger.info(f"Platform: {platform.system()} {platform.release()} ({platform.version()})")
+        logger.info(f"Python version: {platform.python_version()}")
+        
+        # Load configuration using new config_loader system
+        try:
+            from config_loader import load_config, create_config_object
+            
+            # Load configuration from files
+            logger.info("Loading configuration using new config system")
+            config_dict = load_config(yaml_path=args.config, env_path=args.env_file)
+            
+            # Create config object
+            config = create_config_object(config_dict)
+            
+            # Override with any command line arguments that were explicitly provided
+            arg_dict = vars(args)
+            for key, value in arg_dict.items():
+                if value is not None and key != 'config' and key != 'env_file':
+                    # Special case for some parameters that have different names
+                    if key == 'ollama_host' and value:
+                        config.ollama_host = value
+                    elif key == 'ollama_port' and value:
+                        config.ollama_port = value
+                    elif key == 'ollama_model' and value:
+                        config.model = value
+                    else:
+                        setattr(config, key, value)
+                    logger.debug(f"[CONFIG] Overriding {key} with command line value: {value}")
+            
+            # Set defaults for critical parameters if not provided
+            if not hasattr(config, 'ollama_base_url') and hasattr(config, 'ollama_host') and hasattr(config, 'ollama_port'):
+                config.ollama_base_url = f"http://{config.ollama_host}:{config.ollama_port}"
+                
+            # Debug log the final config
+            logger.debug(f"Final configuration: {config}")
+            
+        except ImportError:
+            # Fall back to old configuration system if config_loader isn't available
+            logger.warning("config_loader not found, falling back to old config system")
+            
+            # Create a config object from the arguments
+            config = argparse.Namespace()
+            
+            # Set up the configuration from arguments
+            # Microphone settings
+            config.mic_index = args.mic_index
+            config.energy_threshold = args.energy_threshold
+            config.record_path = args.record_path
+            config.offline = args.offline
+            
+            # TTS settings
+            config.tts_provider = args.tts_provider
+            config.voice = args.voice
+            config.speed = args.speed
+            
+            # LLM settings
+            config.llm_provider = args.llm_provider
+            
+            # OpenAI settings
+            config.openai_api_key = args.openai_api_key
+            config.openai_base_url = args.openai_base_url
+            config.openai_model = args.openai_model
+            
+            # Ollama settings
+            if args.ollama_host and args.ollama_port:
+                config.ollama_base_url = f"http://{args.ollama_host}:{args.ollama_port}"
+            config.ollama_model = args.ollama_model
+            
+            # Conversation settings
+            config.wake_word = args.wake_word
+            config.interrupt_word = args.interrupt_word
+            config.continuous_conversation = not args.no_convo
+            config.test_mode = args.test_mode
+            config.keyboard_mode = args.keyboard_mode
+            config.always_listen = args.always_listen
+            
+            # MCP settings
+            config.use_mcp = args.use_mcp
+            config.mcp_port = args.mcp_port
+            
+            # Support for getting configuration from a config.py file
+            try:
+                from config import CONFIG as user_config
+                logger.info("Loading user configuration from config.py")
+                
+                # Apply user configuration without overwriting command line args
+                for key, value in user_config.items():
+                    if not hasattr(config, key) or getattr(config, key) is None:
+                        setattr(config, key, value)
+                        
+            except ImportError:
+                logger.info("No user config.py found, using defaults or command line args")
+            except Exception as e:
+                logger.error(f"Error loading config.py: {e}")
+        
+        # Add config properties that should be dictionary-accessible
+        config.get = lambda key, default=None: getattr(config, key, default)
+            
+        # Log the effective configuration (excluding sensitive info)
+        config_dict = vars(config).copy()
+        
+        # Redact sensitive information
+        if hasattr(config, 'openai_api_key') and config.openai_api_key:
+            config_dict['openai_api_key'] = '[REDACTED]'
+            
+        # Print important values for debugging purposes
+        logger.info("=" * 60)
+        logger.info("IMPORTANT CONFIGURATION VALUES:")
+        logger.info(f"LLM Provider: {config.get('llm_provider', 'Not set')}")
+        logger.info(f"OpenAI Base URL: {config.get('openai_base_url', 'Not set')}")
+        logger.info(f"OpenAI API Key: {'[SET]' if config.get('openai_api_key') else '[NOT SET]'}")
+        logger.info(f"TTS Model Path: {config.get('tts_model_path', 'Not set')}")
+        logger.info(f"TTS Voices Path: {config.get('tts_voices_path', 'Not set')}")
+        logger.info("=" * 60)
+        
+        # Create and initialize the assistant
+        assistant = StreamingMaxwell(config)
+        
+        # Run the assistant
+        result = assistant.run()
+        return result
+        
+    except KeyboardInterrupt:
+        logger.info("Program interrupted by user")
+        print("\nProgram interrupted by user. Exiting...")
+        return False
+        
     except Exception as e:
-        logger.error(f"Error in main loop: {e}")
+        logger.error(f"Unhandled exception: {e}")
+        # Ensure traceback is imported
+        import traceback
         logger.error(traceback.format_exc())
-    finally:
-        assistant.cleanup()
+        print(f"Error: {str(e)}")
+        return False
 
 if __name__ == "__main__":
     main() 

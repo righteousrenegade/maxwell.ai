@@ -6,28 +6,26 @@ import requests
 import zipfile
 import io
 
-def setup_logger():
-    """Set up and return a logger for the application."""
+def setup_logger(log_level=logging.INFO):
+    """Set up and configure the logger"""
     logger = logging.getLogger("maxwell")
     
-    # Only add handlers if they don't exist already
+    # Only set up the logger if it hasn't been configured yet
     if not logger.handlers:
-        logger.setLevel(logging.INFO)
+        # Set the logging level based on parameter
+        logger.setLevel(log_level)
         
-        # Create console handler
-        handler = logging.StreamHandler(sys.stdout)
-        handler.setLevel(logging.INFO)
-        
-        # Create formatter
+        # Create a formatter
         formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        handler.setFormatter(formatter)
         
-        # Add handler to logger
-        logger.addHandler(handler)
+        # Create console handler and set level
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(log_level)
+        console_handler.setFormatter(formatter)
         
-        # Prevent propagation to the root logger to avoid duplicate logs
-        logger.propagate = False
-    
+        # Add the console handler to the logger
+        logger.addHandler(console_handler)
+        
     return logger
 
 def download_file(url, destination):
