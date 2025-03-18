@@ -144,6 +144,8 @@ class CommandExecutor:
             # Special handling for different tools
             if tool_name == "search_web":
                 kwargs["query"] = args
+            elif tool_name == "details_search_result":
+                kwargs["result_number"] = args
             elif tool_name == "get_weather":
                 if args:
                     kwargs["location"] = args
@@ -283,12 +285,20 @@ class CommandExecutor:
             return self._execute_mcp_tool("search_web", args)
 
         # Special case for details search result command
-        if command == "details" and args.startswith("search result ") and self.use_mcp:
+        if command == "details" and "result" in args and self.use_mcp:
             try:
                 # Extract the result number
-                result_number = args.replace("search result ", "").strip()
-                logger.info(f"Details search result command for result number: {result_number}")
-                return self._execute_mcp_tool("details_search_result", result_number)
+                result_number = ""
+                for char in args:
+                    if char.isdigit():
+                        result_number += char
+                
+                if result_number:
+                    logger.info(f"Details search result command for result number: {result_number}")
+                    return self._execute_mcp_tool("details_search_result", result_number)
+                else:
+                    logger.warning("No result number found in details command")
+                    return "Please specify a result number, e.g., 'details search result 1'"
             except Exception as e:
                 logger.error(f"Error processing details search result command: {e}")
                 return f"Error retrieving search result details: {str(e)}"
@@ -330,9 +340,19 @@ class CommandExecutor:
 
     def _handle_details_command(self, args):
         """Handle the details command for search results"""
-        if args.startswith("search result "):
-            result_number = args.replace("search result ", "").strip()
-            return self._execute_mcp_tool("details_search_result", result_number)
+        # Support multiple phrasings: 'search result 1', 'search results 1', or just 'result 1'
+        if "result" in args:
+            # Extract the result number by finding any digits in the string
+            result_number = ""
+            for char in args:
+                if char.isdigit():
+                    result_number += char
+                    
+            if result_number:
+                logger.info(f"Extracted result number: {result_number}")
+                return self._execute_mcp_tool("details_search_result", result_number)
+            else:
+                return "Please specify which search result number you want details for, e.g., 'details search result 1'"
         else:
             return "Please specify which search result you want details for, e.g., 'details search result 1'"
 

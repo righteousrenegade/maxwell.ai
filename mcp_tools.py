@@ -8,6 +8,12 @@ import re
 import html
 import datetime
 import hashlib
+import traceback
+from googleapiclient.discovery import build
+
+GOOGLE_SEARCH_API_KEY = "AIzaSyD97tA7Lb8YwFvVcqQIZ3xF2eSuRdp_EOE"
+GOOGLE_CSE_ID = "a1690cf8f5fd742b9"  # This is a placeholder, replace with your actual CSE ID
+
 
 # Get the logger instance
 logger = logging.getLogger("maxwell")
@@ -77,67 +83,145 @@ class MCPToolProvider:
             
         @self.tool(name="search_web", description="Search the web for information")
         def search_web(query):
-            """Searches the web and saves raw content for later retrieval"""
+            """Searches the web using Google Custom Search API and saves results for later retrieval"""
             if not query:
                 return "Need a search term."
             
             try:
-                # Direct search
-                url = f"https://www.google.com/search?q={requests.utils.quote(query)}"
-                headers = {"User-Agent": "Mozilla/5.0"}
+                logger.info(f"Searching for: '{query}'")
                 
-                response = requests.get(url, headers=headers, timeout=15)
-                
-                # Save the entire response in the cache
+                # Create search ID and initialize cache
                 search_id = hashlib.md5(query.encode()).hexdigest()[:8]
                 search_results_cache[search_id] = {
                     "query": query,
-                    "html": response.text,
-                    "urls": []
+                    "urls": [],
+                    "titles": [],
+                    "snippets": [],
+                    "contents": []  # New field to store cleaned content
                 }
                 
-                # Just extract the first 3 URLs for detail retrieval
-                soup = BeautifulSoup(response.text, 'html.parser')
+                # Use Google Custom Search API
+                service = build("customsearch", "v1", developerKey=GOOGLE_SEARCH_API_KEY)
+                results = service.cse().list(q=query, cx=GOOGLE_CSE_ID, num=3).execute()
                 
-                # Find all URLs
+                # Check if we have results
+                if 'items' not in results:
+                    logger.warning(f"No search results found for '{query}'")
+                    return f"No search results found for '{query}'. Try a different search term."
+                
+                # Initialize result lists
                 result_urls = []
-                for t in soup.find_all('title'):
-                    # if not a.has_attr('href'):
-                    #     continue
+                result_titles = []
+                result_snippets = []
+                result_contents = []
+                
+                # Process results
+                for item in results['items']:
+                    # Extract URL
+                    url = item.get('link')
+                    if not url:
+                        continue
+                    
+                    # Extract title
+                    title = item.get('title', 'No title available')
+                    
+                    # Extract snippet
+                    snippet = item.get('snippet', 'No description available')
+                    
+                    # Fetch and clean the page content
+                    try:
+                        page_response = requests.get(url, timeout=15, headers={
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+                        })
                         
-                    # href = a['href']
-                    # if href.startswith('/url?q='):
-                    #     url = href.split('/url?q=')[1].split('&')[0]
-                    #     if url.startswith('http') and 'google.com' not in url:
-                    #         result_urls.append(url)
-                    result = t.get_text(strip=True)
+                        if page_response.status_code == 200:
+                            # Parse the content
+                            soup = BeautifulSoup(page_response.text, 'html.parser')
+                            
+                            # Remove scripts, styles, and other non-content elements
+                            for element in soup(['script', 'style', 'meta', 'noscript', 'header', 'footer', 'nav', 'iframe', 'svg']):
+                                element.decompose()
+                            
+                            # Try to find main content
+                            main_content = None
+                            for tag in ['main', 'article', 'div[role="main"]', '.main-content', '#content', '.content', '.post-content']:
+                                main_element = soup.select_one(tag)
+                                if main_element:
+                                    main_content = main_element.get_text(separator='\n', strip=True)
+                                    break
+                            
+                            # If no main content found, use the body text
+                            if not main_content:
+                                main_content = soup.body.get_text(separator='\n', strip=True) if soup.body else soup.get_text(separator='\n', strip=True)
+                            
+                            # Clean up the content
+                            lines = [line.strip() for line in main_content.split('\n') if line.strip()]
+                            content = '\n'.join(lines)
+                            
+                            # Truncate if too long
+                            if len(content) > 2000:
+                                content = content[:2000] + "...(truncated)"
+                        else:
+                            content = f"Failed to fetch content (status: {page_response.status_code})"
+                    except Exception as e:
+                        logger.error(f"Error fetching URL content: {e}")
+                        content = f"Error fetching content: {str(e)}"
+                    
+                    # Add to results
+                    result_urls.append(url)
+                    result_titles.append(title)
+                    result_snippets.append(snippet)
+                    result_contents.append(content)
                 
-                # Take only first 3 URLs
-                result_urls.append(result)
-                # search_results_cache[search_id]["urls"] = result_urls
+                # Log what we found
+                logger.info(f"Found {len(result_urls)} search results")
                 
-                # Return basic results
-                return f"Results for '{query}':\n\n1. Result 1\n2. Result 2\n3. Result 3\n\nUse 'execute details search result 1/2/3' to see content."
+                # Update the cache
+                search_results_cache[search_id]["urls"] = result_urls
+                search_results_cache[search_id]["titles"] = result_titles
+                search_results_cache[search_id]["snippets"] = result_snippets
+                search_results_cache[search_id]["contents"] = result_contents
                 
+                # Check if we found any results
+                if not result_urls:
+                    logger.warning("No search results found")
+                    return f"No search results found for '{query}'. Try a different search term."
+                
+                # Create formatted results with just titles for speaking
+                results_text = f"I found these results for '{query}':\n\n"
+                for i in range(len(result_urls)):
+                    results_text += f"{i+1}. {result_titles[i]}\n"
+                
+                results_text += "\nYou can say 'details 1', 'details 2', or 'details 3' to learn more."
+                
+                return results_text
             except Exception as e:
                 logger.error(f"Search error: {e}")
+                logger.error(traceback.format_exc())
                 return f"Search failed: {e}"
 
         @self.tool(name="details_search_result", description="Get details of a previous search result")
         def details_search_result(result_number):
-            """Gets the content of a URL from search results"""
+            """Gets the content of a URL from search results and provides a summary"""
             try:
                 # Check if we have results
                 if not search_results_cache:
                     return "No search results. Run 'execute search [query]' first."
                 
-                # Parse the result number (1, 2, or 3)
-                if not result_number or not result_number.isdigit():
-                    return "Specify a result number (1, 2, or 3)."
+                # Clean the result number input - extract the first digit
+                cleaned_number = ""
+                for char in str(result_number):
+                    if char.isdigit():
+                        cleaned_number += char
+                        break  # Just take the first digit
                 
-                result_num = int(result_number)
+                # If we couldn't extract a digit, give a helpful message
+                if not cleaned_number:
+                    return "Please specify a result number (1, 2, or 3)."
+                
+                result_num = int(cleaned_number)
                 if result_num < 1 or result_num > 3:
-                    return "Specify a result number between 1 and 3."
+                    return "Please specify a result number between 1 and 3."
                 
                 # Get the most recent search
                 latest_search = list(search_results_cache.keys())[-1]
@@ -145,45 +229,51 @@ class MCPToolProvider:
                 
                 # Check if we have URLs
                 urls = search_data.get("urls", [])
+                titles = search_data.get("titles", [])
+                contents = search_data.get("contents", [])
+                
                 if not urls or len(urls) < result_num:
                     return f"No URL for result {result_num}."
                 
-                # Get the URL for the requested result (0-indexed list)
+                # Get the information for the requested result (0-indexed list)
                 url = urls[result_num - 1]
+                title = titles[result_num - 1] if result_num <= len(titles) else "No title available"
                 
-                # Fetch the content
+                # Get the content if available
+                if contents and len(contents) >= result_num:
+                    content = contents[result_num - 1]
+                else:
+                    content = "Content not available"
+                
+                # Generate a simple summary instead of using the assistant.summarize method
+                summary = ""
                 try:
-                    page_response = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-                    
-                    if page_response.status_code != 200:
-                        return f"Failed to fetch URL (status: {page_response.status_code})"
-                    
-                    # Parse the content
-                    soup = BeautifulSoup(page_response.text, 'html.parser')
-                    
-                    # Get the page title
-                    title = soup.title.string if soup.title else "No title"
-                    
-                    # Remove scripts, styles, etc.
-                    for tag in soup(['script', 'style']):
-                        tag.decompose()
-                    
-                    # Get the text content
-                    content = soup.get_text(separator='\n')
-                    
-                    # Truncate if too long
-                    if len(content) > 1500:
-                        content = content[:1500] + "...(truncated)"
-                    
-                    # Return the details
-                    return f"Details for result {result_num}:\n\nURL: {url}\nTitle: {title}\n\nContent:\n{content}"
-                    
+                    # Only attempt to summarize if we have valid content
+                    if content and content != "Content not available" and not content.startswith("Failed to fetch") and not content.startswith("Error fetching"):
+                        # Extract first few sentences (up to 250 chars) as a simple summary
+                        sentences = re.split(r'(?<=[.!?])\s+', content[:500])
+                        if sentences and len(sentences) > 0:
+                            # Get up to 2 sentences for the summary
+                            summary = " ".join(sentences[:min(2, len(sentences))])
+                            if len(summary) > 250:
+                                summary = summary[:247] + "..."
+                    else:
+                        summary = "No summary available."
                 except Exception as e:
-                    logger.error(f"Error fetching URL: {e}")
-                    return f"Error fetching URL content: {e}"
+                    logger.error(f"Error generating simple summary: {e}")
+                    summary = "No summary available."
                 
+                # Prepare the response - format optimized for speech
+                # Use a more natural response format to avoid triggering more commands
+                response = f"Here's result {result_num}: {title}\n\n"
+                if summary:
+                    response += f"{summary}\n\n"
+                response += f"Source: {url}"
+                
+                return response
             except Exception as e:
                 logger.error(f"Error retrieving result: {e}")
+                logger.error(traceback.format_exc())
                 return f"Error retrieving result: {e}"
             
         @self.tool(name="set_reminder", description="Set a reminder with optional time")

@@ -16,6 +16,7 @@ A modular voice assistant powered by Ollama LLM and Kokoro TTS.
 - **Command Execution**: Built-in commands including web search
 - **Interrupt Capability**: Can be interrupted while speaking
 - **Offline Mode**: Optional offline speech recognition with Vosk
+- **Robust Listening**: Uses an audio buffer to capture speech that might start before wake word detection completes
 
 ## Installation
 
@@ -51,6 +52,10 @@ The assistant supports many command-line options:
 ```
 python assistant.py --help
 ```
+
+Some useful options include:
+- `--buffer-duration=5.0`: Set the audio buffer duration in seconds (default: 3.0)
+- `--energy-threshold=200`: Adjust microphone sensitivity (lower = more sensitive)
 
 ### Voice Commands
 

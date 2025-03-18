@@ -45,7 +45,11 @@ class Maxwell:
         
         # Initialize AudioManager
         logger.info("Initializing AudioManager...")
-        self.audio_manager = AudioManager(mic_index=config.mic_index, energy_threshold=config.energy_threshold)
+        self.audio_manager = AudioManager(
+            mic_index=config.mic_index, 
+            energy_threshold=config.energy_threshold,
+            buffer_duration=config.buffer_duration
+        )
         
         # Set callbacks
         self.audio_manager.on_speech_detected = self._on_speech_detected
@@ -258,9 +262,10 @@ def main():
     parser.add_argument("--use-mcp", action="store_true", help="Enable MCP tools integration")
     parser.add_argument("--mcp-port", default=8080, type=int, help="Port for MCP server")
     parser.add_argument("--mic-index", type=int, help="Specific microphone index to use")
+    parser.add_argument("--buffer-duration", type=float, default=3.0, help="Duration in seconds for audio buffer (default: 3.0)")
+    parser.add_argument("--energy-threshold", type=int, default=300, help="Energy threshold for speech detection (default: 300)")
     parser.add_argument("--keyboard-mode", action="store_true", help="Use keyboard input instead of microphone")
     parser.add_argument("--always-listen", action="store_true", help="Always listen for commands without wake word")
-    parser.add_argument("--energy-threshold", type=int, default=300, help="Energy threshold for speech recognition (lower = more sensitive)")
     parser.add_argument("--list-mics", action="store_true", help="List available microphones and exit")
     parser.add_argument("--save-audio", action="store_true", help="Save audio files for debugging")
     parser.add_argument("--mic-name", help="Specific microphone name to use (partial match)")
@@ -318,6 +323,7 @@ def main():
         mic_index=args.mic_index,
         always_listen=args.always_listen,
         energy_threshold=args.energy_threshold,
+        buffer_duration=args.buffer_duration,
         save_audio=args.save_audio,
         sample_rate=args.sample_rate,
         listen_timeout=args.listen_timeout

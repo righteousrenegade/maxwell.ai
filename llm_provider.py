@@ -114,6 +114,7 @@ class LLMProvider(ABC):
         
         # Add system prompt if available
         if self.system_prompt:
+            logger.info(f"Adding system prompt: {self.system_prompt}")
             messages.append({"role": "system", "content": self.system_prompt})
             
         # Add user message

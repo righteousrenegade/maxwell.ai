@@ -57,6 +57,7 @@ You will make subtle jokes and sarcastic remarks occasionally in your response.
     
     # Performance and debugging
     "energy_threshold": 300,  # Lower = more sensitive microphone
+    "buffer_duration": 3.0,   # Duration in seconds for audio buffer
     "save_audio": False,      # Save audio files for debugging
     "debug": False,           # Enable debug logging
 }
@@ -82,6 +83,7 @@ class Config:
         mic_name=None,
         always_listen=False,
         energy_threshold=CONFIG_DEFAULTS["energy_threshold"],
+        buffer_duration=CONFIG_DEFAULTS["buffer_duration"],
         debug=CONFIG_DEFAULTS["debug"],
         save_audio=CONFIG_DEFAULTS["save_audio"],
         sample_rate=None,
@@ -115,6 +117,7 @@ class Config:
         self.mic_name = mic_name
         self.always_listen = always_listen
         self.energy_threshold = energy_threshold
+        self.buffer_duration = buffer_duration
         self.debug = debug
         self.save_audio = save_audio
         self.sample_rate = sample_rate

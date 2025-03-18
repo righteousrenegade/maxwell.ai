@@ -8,6 +8,7 @@ general:
   voice: "bm_lewis"
   speed: 1.15
   listen_timeout: 7
+  buffer_duration: 3.0
   energy_threshold: 300  # Lower = more sensitive microphone
   save_audio: false      # Save audio files for debugging
   debug: false           # Enable debug logging

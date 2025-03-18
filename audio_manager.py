@@ -5,6 +5,10 @@ import os
 import traceback
 import threading
 from utils import setup_logger
+import collections
+import io
+import numpy as np
+import wave
 
 # Get the logger instance
 logger = logging.getLogger("maxwell")
@@ -16,7 +20,7 @@ class AudioManager:
     Centralized manager for all audio input and processing.
     Only ONE instance of this class should exist in the entire application.
     """
-    def __init__(self, mic_index=None, energy_threshold=300):
+    def __init__(self, mic_index=None, energy_threshold=300, buffer_duration=3.0):
         self.mic_index = mic_index
         self.recognizer = sr.Recognizer()
         self.recognizer.energy_threshold = energy_threshold
@@ -44,10 +48,18 @@ class AudioManager:
         self.recognition_attempts = 0
         self.recognition_successes = 0
         
+        # Audio buffer system
+        self.buffer_duration = buffer_duration  # Buffer duration in seconds
+        self.audio_buffer = collections.deque(maxlen=5)  # Store recent audio chunks
+        self.buffer_sample_rate = 16000  # Standard sample rate
+        self.buffer_sample_width = 2  # 16-bit audio (2 bytes)
+        self.is_buffering = False
+        self.buffer_thread = None
+        
         # List available microphones
         self._list_microphones()
         
-        logger.info(f"AudioManager initialized with energy threshold: {energy_threshold}")
+        logger.info(f"AudioManager initialized with energy threshold: {energy_threshold}, buffer duration: {buffer_duration}s")
         
     def _list_microphones(self):
         """List available microphones for debugging purposes"""
@@ -77,10 +89,63 @@ class AudioManager:
             logger.info("Still listening for speech input...")
             self.last_audio_timestamp = now
     
+    def _audio_buffer_thread(self):
+        """Background thread that continuously buffers audio"""
+        logger.info("Audio buffer thread started")
+        
+        try:
+            with self.microphone as source:
+                # Configure the source
+                source.format = 8192  # 16kHz sampling rate
+                source.SAMPLE_WIDTH = 2  # 16-bit audio
+                
+                # Main buffering loop
+                while not self.should_stop and self.is_buffering:
+                    try:
+                        # Capture a short chunk of audio (non-blocking)
+                        buffer_audio = self.recognizer.record(source, duration=0.5)
+                        self.audio_buffer.append(buffer_audio)
+                        logger.debug(f"Added audio chunk to buffer (length: {len(self.audio_buffer)})")
+                    except Exception as e:
+                        if self.should_stop or not self.is_buffering:
+                            break
+                        logger.error(f"Error in audio buffer thread: {e}")
+                        time.sleep(0.1)  # Prevent tight loop on error
+                        
+        except Exception as e:
+            logger.error(f"Error in audio buffer thread: {e}")
+            logger.error(traceback.format_exc())
+            
+        logger.info("Audio buffer thread stopped")
+        self.is_buffering = False
+    
+    def _get_buffered_audio(self):
+        """Combine buffered audio chunks into a single audio data"""
+        if not self.audio_buffer:
+            return None
+            
+        logger.info(f"Combining {len(self.audio_buffer)} audio chunks from buffer")
+        
+        # Create a new sr.AudioData object that combines all buffered chunks
+        combined_frames = bytearray()
+        sample_rate = self.buffer_sample_rate
+        sample_width = self.buffer_sample_width
+        
+        # Concatenate all frame data
+        for audio in self.audio_buffer:
+            combined_frames.extend(audio.frame_data)
+        
+        # Return as an AudioData object
+        return sr.AudioData(bytes(combined_frames), sample_rate, sample_width)
+                
     def _background_listening_thread(self):
         """Background thread that continuously listens for speech"""
         logger.info("Background listening thread started")
         print("🎤 Microphone activated and listening")
+        
+        # Start the audio buffering thread if not already running
+        if not self.is_buffering:
+            self._start_audio_buffer()
         
         # Create and configure microphone
         try:
@@ -154,6 +219,9 @@ class AudioManager:
                     
         logger.info("Background listening thread stopped")
         print("🛑 Microphone listening stopped")
+        
+        # Stop audio buffering
+        self.is_buffering = False
     
     def _speech_callback(self, recognizer, audio):
         """Callback function for processing audio"""
@@ -186,6 +254,29 @@ class AudioManager:
                 if self._check_wake_word(text):
                     logger.info(f"Wake word detected in: '{text}'")
                     print(f"🔔 Wake word detected!")
+                    
+                    # Get buffered audio and combine with current audio for better context
+                    if self.audio_buffer:
+                        logger.info("Retrieving buffered audio to provide context")
+                        buffered_audio = self._get_buffered_audio()
+                        if buffered_audio:
+                            try:
+                                # Try to recognize speech from the buffered audio
+                                logger.info("Attempting to recognize speech from buffer")
+                                buffer_text = recognizer.recognize_google(buffered_audio)
+                                logger.info(f"Buffer recognized: '{buffer_text}'")
+                                
+                                # Combine detected text with buffered text for better context
+                                combined_text = f"{buffer_text} {text}"
+                                logger.info(f"Combined text: '{combined_text}'")
+                                
+                                # Use combined text instead
+                                text = combined_text
+                            except Exception as e:
+                                logger.warning(f"Could not recognize buffer: {e}")
+                                # Continue with just the current text
+                                pass
+                    
                     self.in_conversation = True
                     if self.on_speech_detected:
                         logger.info("Calling wake word callback")
@@ -228,6 +319,20 @@ class AudioManager:
             logger.error(f"Error processing audio: {e}")
             logger.error(traceback.format_exc())
             print(f"❌ Error processing audio: {str(e)}")
+    
+    def _start_audio_buffer(self):
+        """Start the audio buffering thread"""
+        if self.is_buffering:
+            logger.info("Audio buffer is already running")
+            return
+            
+        self.is_buffering = True
+        self.buffer_thread = threading.Thread(
+            target=self._audio_buffer_thread,
+            daemon=True
+        )
+        self.buffer_thread.start()
+        logger.info("Audio buffer thread started")
         
     def start(self, wake_word=None, interrupt_word=None):
         """Start the background listening"""
@@ -286,6 +391,7 @@ class AudioManager:
             
         # Signal thread to stop
         self.should_stop = True
+        self.is_buffering = False
         logger.info("Set should_stop flag to True")
         
         # Wait for thread to terminate
@@ -342,5 +448,8 @@ class AudioManager:
             "recognition_count": self.recognition_count,
             "energy_threshold": self.recognizer.energy_threshold,
             "recognition_attempts": self.recognition_attempts,
-            "recognition_successes": self.recognition_successes
+            "recognition_successes": self.recognition_successes,
+            "is_buffering": self.is_buffering,
+            "buffer_size": len(self.audio_buffer) if self.audio_buffer else 0,
+            "buffer_duration": self.buffer_duration
         } 
