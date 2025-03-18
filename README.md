@@ -5,7 +5,7 @@ A modular voice assistant powered by Ollama LLM and Kokoro TTS.
 ## DEMO
 
 [![Watch the demo!](media/maxwelldemo.mp4)](media/maxwelldemo.mp4)
-
+![Maxwell.AI](media/maxwellai1.png)
 
 ## Features
 
