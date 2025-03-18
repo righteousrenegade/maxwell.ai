@@ -1,0 +1,46 @@
+# Maxwell Assistant Configuration
+# Edit this file to customize your settings
+
+# General settings
+general:
+  wake_word: "hello maxwell"
+  interrupt_word: "stop talking"
+  voice: "bm_lewis"
+  speed: 1.15
+  listen_timeout: 7
+  buffer_duration: 3.0
+  energy_threshold: 300  # Lower = more sensitive microphone
+  save_audio: false      # Save audio files for debugging
+  debug: false           # Enable debug logging
+
+# LLM Provider Configuration
+llm:
+  provider: "openai"  # Choose: "ollama" or "openai"
+  
+  # System prompt (personality)
+  system_prompt: |
+    You are Maxwell, a helpful and friendly, intelligent voice assistant.
+    You will answer questions in 2-3 sentences unless otherwise directed. You are pithy and concise, and have an exceptional wit.
+    You make subtle jokes and sarcastic remarks occasionally in your response.
+    You will never, ever, ever respond in anything like markdown or formatted text. You will only respond in a conversational response.
+
+# Ollama Configuration (used when provider = "ollama")
+ollama:
+  model: "llama3"
+  host: "http://localhost"
+  port: 11434
+
+# OpenAI Configuration (used when provider = "openai")
+openai:
+  # IMPORTANT: Set your API key here
+  api_key: "YOUR_API_KEY_HERE"  
+  base_url: "http://localhost:1234/v1"
+  model: "gemma-3-27b-it"
+  temperature: 0.7
+  max_tokens: null  # null means let the API decide
+
+# Kokoro TTS Configuration
+tts:
+  # Path to Kokoro TTS model files
+  model_path: "kokoro-v1.0.onnx"
+  voices_path: "voices-v1.0.bin" 
