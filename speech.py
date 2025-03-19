@@ -40,6 +40,10 @@ class TextToSpeech:
         self._speaking_lock = threading.Lock()
         self.voice = voice if voice != 'default' else 'en_us_1'  # Default to first voice if not specified
         
+        # Add speech state callbacks
+        self.on_speaking_started = None
+        self.on_speaking_stopped = None
+        
         try:
             # Get paths for Kokoro from config if available
             model_path = None
@@ -126,6 +130,13 @@ class TextToSpeech:
         with self._speaking_lock:
             self._is_speaking = True
             
+        # Call the speaking started callback if it exists
+        if self.on_speaking_started:
+            try:
+                self.on_speaking_started()
+            except Exception as e:
+                logger.error(f"Error in on_speaking_started callback: {e}")
+            
         # Run in a separate thread to avoid blocking
         thread = threading.Thread(target=self._speak_thread, args=(text,), daemon=True)
         thread.start()
@@ -181,6 +192,14 @@ class TextToSpeech:
             # Important: Clear speaking flag when done
             with self._speaking_lock:
                 self._is_speaking = False
+                
+            # Call the speaking stopped callback if it exists
+            if self.on_speaking_stopped:
+                try:
+                    self.on_speaking_stopped()
+                except Exception as e:
+                    logger.error(f"Error in on_speaking_stopped callback: {e}")
+                    
             logger.info("Speech thread completed, speaking flag cleared")
             
     def stop(self):
@@ -193,6 +212,13 @@ class TextToSpeech:
             # Update speaking state
             with self._speaking_lock:
                 self._is_speaking = False
+                
+            # Call the speaking stopped callback if it exists
+            if self.on_speaking_stopped:
+                try:
+                    self.on_speaking_stopped()
+                except Exception as e:
+                    logger.error(f"Error in on_speaking_stopped callback: {e}")
             
     def is_speaking(self):
         """Check if currently speaking"""

@@ -27,6 +27,7 @@ import re
 from dataclasses import dataclass
 from typing import List, Dict, Any, Callable, Optional
 from key_handler import KeyboardHandler
+import collections
 
 # Version
 __version__ = "1.0.0"
@@ -58,10 +59,24 @@ def list_microphones():
         return []
 
 class StreamingAudioManager:
-    """Audio manager that uses PyAudio directly for more reliable audio capture"""
+    """Audio manager that uses PyAudio directly for more reliable audio capture.
+    
+    This implementation uses a fully continuous listening approach:
+    
+    1. The microphone is ALWAYS listening, regardless of whether the assistant is speaking
+    2. Audio is continuously recorded when above a dynamic energy threshold
+    3. When the assistant is speaking, the energy threshold is raised to filter out self-speech
+    4. Detected speech is added to a buffer for asynchronous processing
+    5. A separate thread processes the speech buffer independently from the listening thread
+    
+    This approach allows the assistant to hear the user even while speaking,
+    while minimizing self-triggering by dynamically adjusting energy thresholds.
+    """
     def __init__(self, mic_index=None, energy_threshold=300):
         self.mic_index = mic_index
         self.energy_threshold = energy_threshold
+        self.default_energy_threshold = energy_threshold
+        self.speaking_energy_threshold = energy_threshold * 2.5  # Increased ratio to better filter self-speech
         self.running = False
         self.in_conversation = False
         
@@ -103,8 +118,28 @@ class StreamingAudioManager:
         self.recognition_successes = 0
         self.listen_count = 0  # Add this counter for debug mode
         
-        # Add a flag to prevent processing while the assistant is speaking
-        self.pause_for_speaking = False
+        # Speech buffer for continuous processing
+        self.speech_buffer = []
+        self.speech_buffer_lock = threading.Lock()
+        self.speech_processing_thread = None
+        self.is_assistant_speaking = False
+        
+        # Track speaking state with additional delay
+        self.speaking_end_time = 0
+        self.post_speaking_delay = 1.0  # Additional delay after speaking to avoid self-triggering
+        
+        # Recent patterns detection to avoid self-triggering
+        self.recent_recognitions = collections.deque(maxlen=5)  # Store recent recognitions
+        
+        # Audio characteristics tracking for self-speech detection
+        self.audio_stats = {
+            "assistant_speech": {
+                "volume_avg": [],      # Store average volumes during assistant speech
+                "volume_peak": [],     # Store peak volumes during assistant speech
+                "spectrum_profile": [] # Store spectrum profiles of assistant speech
+            },
+            "last_spoken_time": 0
+        }
         
         # List available microphones
         self._list_microphones()
@@ -148,57 +183,118 @@ class StreamingAudioManager:
         """Check if we're in conversation mode"""
         return self.in_conversation
     
+    def _analyze_audio_characteristics(self, audio_data):
+        """Analyze audio characteristics to help distinguish self-speech"""
+        try:
+            # Convert audio data to numpy array if it's not already
+            if isinstance(audio_data, bytes):
+                audio_np = np.frombuffer(audio_data, dtype=np.int16)
+            else:
+                audio_np = audio_data
+                
+            # Basic volume statistics
+            volume_avg = np.abs(audio_np).mean()
+            volume_peak = np.abs(audio_np).max()
+            
+            # Frequency domain analysis (simple spectral profile)
+            if len(audio_np) > self.CHUNK:
+                # Get a segment for frequency analysis
+                segment = audio_np[:self.CHUNK]
+                # Calculate FFT
+                spectrum = np.abs(np.fft.rfft(segment))
+                # Simplify to a few bands (low, mid, high)
+                bands = 10
+                spectrum_profile = []
+                band_size = len(spectrum) // bands
+                for i in range(bands):
+                    start = i * band_size
+                    end = (i + 1) * band_size if i < bands - 1 else len(spectrum)
+                    band_energy = np.sum(spectrum[start:end])
+                    spectrum_profile.append(band_energy)
+                
+                # Normalize the profile
+                if sum(spectrum_profile) > 0:
+                    spectrum_profile = [e / sum(spectrum_profile) for e in spectrum_profile]
+            else:
+                spectrum_profile = []
+                
+            return {
+                "volume_avg": volume_avg,
+                "volume_peak": volume_peak,
+                "spectrum_profile": spectrum_profile
+            }
+        except Exception as e:
+            logger.error(f"Error analyzing audio characteristics: {e}")
+            return {
+                "volume_avg": 0,
+                "volume_peak": 0,
+                "spectrum_profile": []
+            }
+    
+    def _is_audio_self_speech(self, audio_data):
+        """Determine if audio matches characteristics of assistant's speech"""
+        # Only use this method if we have collected enough samples
+        if len(self.audio_stats["assistant_speech"]["volume_avg"]) < 3:
+            return False
+            
+        # Get stats for this audio
+        stats = self._analyze_audio_characteristics(audio_data)
+        
+        # Compare with assistant speech characteristics
+        assistant_avg_volume = np.mean(self.audio_stats["assistant_speech"]["volume_avg"])
+        assistant_peak_volume = np.mean(self.audio_stats["assistant_speech"]["volume_peak"])
+        
+        # Volume similarity check
+        volume_similarity = abs(stats["volume_avg"] - assistant_avg_volume) / assistant_avg_volume if assistant_avg_volume > 0 else 1.0
+        peak_similarity = abs(stats["volume_peak"] - assistant_peak_volume) / assistant_peak_volume if assistant_peak_volume > 0 else 1.0
+        
+        # Spectrum comparison (if available)
+        spectrum_similarity = 1.0  # Default to high dissimilarity
+        if stats["spectrum_profile"] and self.audio_stats["assistant_speech"]["spectrum_profile"]:
+            # Use the most recent spectrum profile
+            assistant_spectrum = self.audio_stats["assistant_speech"]["spectrum_profile"][-1]
+            
+            # Only compare if both profiles have values
+            if assistant_spectrum and stats["spectrum_profile"] and len(assistant_spectrum) == len(stats["spectrum_profile"]):
+                # Calculate Euclidean distance between spectrum profiles
+                try:
+                    distance = np.sqrt(sum((a - b) ** 2 for a, b in zip(assistant_spectrum, stats["spectrum_profile"])))
+                    spectrum_similarity = min(distance, 1.0)  # Normalize between 0-1
+                except Exception as e:
+                    logger.error(f"Error calculating spectrum similarity: {e}")
+        
+        # Calculate overall similarity score (weighted) - lower weights to make less sensitive
+        similarity_score = (volume_similarity * 0.3) + (peak_similarity * 0.2) + (spectrum_similarity * 0.2)
+        
+        # Apply time decay - less likely to be self-speech as time passes
+        time_since_speech = time.time() - self.audio_stats["last_spoken_time"]
+        time_factor = max(0, 1.0 - (time_since_speech / 2.0))  # Faster decay over 2 seconds
+        
+        # Final probability score
+        self_speech_probability = similarity_score * time_factor
+        
+        # Log detailed analysis if in debug mode
+        if self.debug_mode:
+            logger.debug(f"Audio self-speech analysis: " +
+                        f"vol_sim={volume_similarity:.2f}, peak_sim={peak_similarity:.2f}, " +
+                        f"spec_sim={spectrum_similarity:.2f}, time_factor={time_factor:.2f}, " +
+                        f"probability={self_speech_probability:.2f}")
+        
+        # Higher threshold during and just after speaking - more permissive thresholds
+        threshold = 0.65 if self._should_use_elevated_threshold() else 0.80
+        
+        return self_speech_probability > threshold
+    
     def _processing_thread_func(self):
         """Background thread that continuously processes audio"""
         logger.info("Audio processing thread started")
         print("🎤 Microphone activated and listening")
         
         self.listen_count = 0
-        while not self.should_stop:
-            self.listen_count += 1
-            
-            # Skip audio processing if we're paused for speaking
-            if self.pause_for_speaking:
-                time.sleep(0.1)  # Small delay
-                continue
-                
-            if self.listen_count % 5 == 0:
-                if not self.in_conversation:
-                    print("👂 Waiting for wake word...")
-                else:
-                    print("👂 Listening for commands...")
-            
-            # Record audio
-            audio_data = self._record_audio()
-            
-            # Check if we should stop
-            if self.should_stop:
-                logger.info("Stop flag detected, exiting processing loop")
-                break
-                
-            # Check if we got some audio
-            if audio_data is None or len(audio_data) == 0:
-                time.sleep(0.1)  # Small delay
-                continue
-                
-            # Save audio to temporary file
-            temp_file = os.path.join(self.temp_dir, f"audio_{int(time.time())}.wav")
-            self._save_audio(audio_data, temp_file)
-            
-            # Recognize speech
-            text = self._recognize_speech(temp_file)
-            
-            if text:
-                # Process the recognized speech
-                self._process_speech(text)
-                
-        logger.info("Audio processing thread stopped")
-        print("🛑 Microphone listening stopped")
-    
-    def _record_audio(self):
-        """Record audio from microphone when sound is detected"""
+        last_stats_collect_time = 0
+        
+        # Open a continuous microphone stream
         try:
-            # Open stream
             stream = self.p.open(
                 format=self.FORMAT,
                 channels=self.CHANNELS,
@@ -208,96 +304,380 @@ class StreamingAudioManager:
                 input_device_index=self.mic_index
             )
             
-            # Wait for sound above threshold
+            # Buffer to collect audio when above threshold
             frames = []
+            is_recording = False
             silent_frames = 0
-            is_speaking = False
-            max_silent_frames = int(self.RATE / self.CHUNK * 1.5)  # Increased silence tolerance to 1.5 seconds
+            max_silent_frames = int(self.RATE / self.CHUNK * 1.5)  # 1.5 seconds of silence
+            recording_start = 0
+            max_record_time = self.RECORD_SECONDS
             
-            # Start a timer
-            start_time = time.time()
-            timeout = 0.5  # Half second timeout for checking sound
-            
-            # Debug volume levels occasionally
-            if self.debug_mode and random.random() < 0.1:  # 10% chance to log
-                # Read some data to check levels
-                debug_data = stream.read(self.CHUNK, exception_on_overflow=False)
-                debug_audio = np.frombuffer(debug_data, dtype=np.int16)
-                volume = np.abs(debug_audio).mean()
-                logger.debug(f"Current volume: {volume:.1f} (threshold: {self.energy_threshold})")
-            
-            while time.time() - start_time < timeout and not is_speaking and not self.should_stop:
-                # Read audio data
+            while not self.should_stop:
+                self.listen_count += 1
+                
+                if self.listen_count % 30 == 0:  # Throttle status messages
+                    if not self.in_conversation:
+                        print("👂 Waiting for wake word...")
+                    else:
+                        print("👂 Listening for commands...")
+                
+                # Always read from microphone
                 data = stream.read(self.CHUNK, exception_on_overflow=False)
                 
                 # Convert to numpy array
                 audio_data = np.frombuffer(data, dtype=np.int16)
                 
-                # Check volume
+                # Get current volume level
                 volume = np.abs(audio_data).mean()
                 self.last_volume = volume
                 
-                # Show volume in debug mode
+                # Collect audio statistics when assistant is speaking
+                current_time = time.time()
+                if self.is_assistant_speaking and current_time - last_stats_collect_time > 0.2:  # Every 200ms
+                    # Analyze audio characteristics
+                    stats = self._analyze_audio_characteristics(audio_data)
+                    self.audio_stats["assistant_speech"]["volume_avg"].append(stats["volume_avg"])
+                    self.audio_stats["assistant_speech"]["volume_peak"].append(stats["volume_peak"])
+                    if stats["spectrum_profile"]:
+                        self.audio_stats["assistant_speech"]["spectrum_profile"].append(stats["spectrum_profile"])
+                    last_stats_collect_time = current_time
+                    
+                    if self.debug_mode and self.listen_count % 20 == 0:
+                        logger.debug(f"Collected assistant speech audio stats: vol_avg={stats['volume_avg']:.1f}, vol_peak={stats['volume_peak']:.1f}")
+                
+                # Debug volume occasionally
                 if self.debug_mode and self.listen_count % 10 == 0:
-                    logger.debug(f"Current volume: {volume:.1f} (threshold: {self.energy_threshold})")
-                    
-                if volume > self.energy_threshold:
-                    is_speaking = True
-                    frames.append(data)
-                    logger.debug(f"Sound detected! Volume: {volume}")
-                    print("🔊 Sound detected! Recording...")
-                    
-                    # Play a beep sound when sound is first detected
-                    self._play_sound(frequency=1000, duration=50)  # Short higher-pitched beep
+                    current_threshold = self.energy_threshold
+                    logger.debug(f"Current volume: {volume:.1f} (threshold: {current_threshold})")
                 
-            # If no sound detected or should stop, return None
-            if not is_speaking or self.should_stop:
-                stream.stop_stream()
-                stream.close()
-                return None
-                
-            # Record until silence
-            recording_start = time.time()
-            max_record_time = self.RECORD_SECONDS  # Maximum recording time
-            
-            while not self.should_stop:
-                # Check if we've recorded too long
-                if time.time() - recording_start > max_record_time:
-                    logger.info("Maximum recording time reached")
-                    break
-                    
-                # Read audio data
-                data = stream.read(self.CHUNK, exception_on_overflow=False)
-                frames.append(data)
-                
-                # Convert to numpy array
-                audio_data = np.frombuffer(data, dtype=np.int16)
-                
-                # Check volume
-                volume = np.abs(audio_data).mean()
-                
-                if volume < self.energy_threshold:
-                    silent_frames += 1
-                    if silent_frames > max_silent_frames:
-                        logger.debug("Silence detected, stopping recording")
-                        break
+                # Determine current threshold based on speaking state and delay
+                # Use lower threshold when waiting for wake word to make it easier to activate
+                if not self.in_conversation:
+                    # When not in conversation, use even lower threshold for wake word detection
+                    current_threshold = self.speaking_energy_threshold * 0.8 if self._should_use_elevated_threshold() else self.energy_threshold * 0.9
                 else:
-                    silent_frames = 0
-            
-            # Stop and close the stream
+                    # Normal thresholds during conversation
+                    current_threshold = self.speaking_energy_threshold if self._should_use_elevated_threshold() else self.energy_threshold
+                
+                if volume > current_threshold:
+                    # If we weren't recording before, start a new recording
+                    if not is_recording:
+                        is_recording = True
+                        frames = [data]  # Start with this chunk
+                        recording_start = time.time()
+                        logger.debug(f"Started recording (volume: {volume:.1f}, threshold: {current_threshold})")
+                        # Only show audio detection if not too frequent
+                        if self.listen_count % 5 == 0:
+                            print("🔊 Sound detected...")
+                    else:
+                        # Continue recording
+                        frames.append(data)
+                        silent_frames = 0
+                else:
+                    # Below threshold
+                    if is_recording:
+                        frames.append(data)  # Still append to get smooth endings
+                        silent_frames += 1
+                        
+                        # Check if we've been silent long enough to stop recording
+                        if silent_frames > max_silent_frames:
+                            # We've detected enough silence - process this audio segment
+                            audio_data = b''.join(frames)
+                            
+                            # Skip if it's likely to be assistant's own speech
+                            should_process = True
+                            
+                            # For audio recorded during assistant speech, check if it's self-speech
+                            # But be more cautious about filtering - we still want to process potential wake words
+                            if self.is_assistant_speaking:
+                                # Check if this audio is likely self-speech by audio characteristics
+                                if self._is_audio_self_speech(audio_data):
+                                    logger.info("Detected likely self-speech by audio characteristics, skipping")
+                                    should_process = False
+                                    
+                            if should_process:
+                                # Save to temp file and process in separate thread to avoid blocking
+                                temp_file = os.path.join(self.temp_dir, f"audio_{int(time.time())}.wav")
+                                self._save_audio(audio_data, temp_file)
+                                
+                                # Add to buffer for processing
+                                with self.speech_buffer_lock:
+                                    self.speech_buffer.append(temp_file)
+                                    logger.debug(f"Added audio to speech buffer (length: {len(self.speech_buffer)})")
+                            
+                            # Reset recording state
+                            is_recording = False
+                            frames = []
+                            silent_frames = 0
+                        
+                        # Check if we've been recording too long
+                        elif time.time() - recording_start > max_record_time:
+                            logger.info("Maximum recording time reached")
+                            # Save what we have so far
+                            audio_data = b''.join(frames)
+                            
+                            # Skip if it's likely to be assistant's own speech
+                            should_process = True
+                            
+                            # Be more cautious about filtering while speaking
+                            if self.is_assistant_speaking:
+                                # Check if this audio is likely self-speech by audio characteristics
+                                if self._is_audio_self_speech(audio_data):
+                                    logger.info("Detected likely self-speech by audio characteristics, skipping")
+                                    should_process = False
+                                    
+                            if should_process:
+                                # Save to temp file and process in separate thread
+                                temp_file = os.path.join(self.temp_dir, f"audio_{int(time.time())}.wav")
+                                self._save_audio(audio_data, temp_file)
+                                
+                                # Add to buffer for processing
+                                with self.speech_buffer_lock:
+                                    self.speech_buffer.append(temp_file)
+                                    logger.debug(f"Added audio to speech buffer (length: {len(self.speech_buffer)})")
+                            
+                            # Reset recording state
+                            is_recording = False
+                            frames = []
+                            silent_frames = 0
+                
+                # Small sleep to prevent tight loop
+                time.sleep(0.01)
+                
+            # Clean up
             stream.stop_stream()
             stream.close()
             
-            if self.should_stop:
-                return None
+        except Exception as e:
+            logger.error(f"Error in audio processing thread: {e}")
+            logger.error(traceback.format_exc())
+            
+        logger.info("Audio processing thread stopped")
+        print("🛑 Microphone listening stopped")
+    
+    def _speech_processing_thread_func(self):
+        """Separate thread that processes the speech buffer"""
+        logger.info("Speech processing thread started")
+        
+        while not self.should_stop:
+            # Check if there's anything in the buffer
+            audio_file = None
+            with self.speech_buffer_lock:
+                if self.speech_buffer:
+                    audio_file = self.speech_buffer.pop(0)
+            
+            if audio_file:
+                # Get current speaking state and elapsed time since speaking
+                process_immediately = True
+                time_since_speaking_stopped = time.time() - self.speaking_end_time
                 
-            logger.info(f"Recording completed, {len(frames)} chunks captured")
-            return b''.join(frames)
+                # Apply stricter filtering only if actually speaking (not after speaking)
+                # This allows wake words to be detected right after the assistant stops speaking
+                if self.is_assistant_speaking:
+                    logger.debug("Processing audio recorded while assistant was speaking - applying filtering")
+                    # Add a shorter delay for audio recorded while speaking
+                    logger.debug(f"Small delay before processing audio recorded during speech")
+                    time.sleep(0.4)  # Cut delay in half
+                
+                # Process this audio file if not filtered out
+                if process_immediately or not self.should_stop:
+                    text = self._recognize_speech(audio_file)
+                    
+                    if text:
+                        # Process the recognized speech
+                        self._process_speech(text)
+                    
+                # Remove the temp file after processing
+                try:
+                    os.remove(audio_file)
+                except:
+                    pass
+            else:
+                # No audio to process, sleep a bit
+                time.sleep(0.1)
+        
+        logger.info("Speech processing thread stopped")
+    
+    def set_assistant_speaking(self, is_speaking):
+        """Set whether the assistant is currently speaking to adjust thresholds"""
+        self.is_assistant_speaking = is_speaking
+        if is_speaking:
+            # Set the higher threshold when speaking
+            logger.info(f"Assistant is speaking - increasing energy threshold to {self.speaking_energy_threshold}")
+            # Reset assistant speech audio characteristics collection
+            if len(self.audio_stats["assistant_speech"]["volume_avg"]) > 10:
+                # Keep only the most recent 10 samples
+                self.audio_stats["assistant_speech"]["volume_avg"] = self.audio_stats["assistant_speech"]["volume_avg"][-10:]
+                self.audio_stats["assistant_speech"]["volume_peak"] = self.audio_stats["assistant_speech"]["volume_peak"][-10:]
+                self.audio_stats["assistant_speech"]["spectrum_profile"] = self.audio_stats["assistant_speech"]["spectrum_profile"][-10:]
+        else:
+            # Set time to keep higher threshold for a short delay after speaking
+            self.speaking_end_time = time.time() + self.post_speaking_delay
+            self.audio_stats["last_spoken_time"] = time.time()
+            logger.info(f"Assistant stopped speaking - will restore threshold after {self.post_speaking_delay} seconds")
+    
+    def _should_use_elevated_threshold(self):
+        """Determine whether to use the elevated threshold based on speaking status and timing"""
+        # Always use elevated threshold if actively speaking
+        if self.is_assistant_speaking:
+            return True
+            
+        # Use elevated threshold during the post-speaking delay period
+        if time.time() < self.speaking_end_time:
+            return True
+            
+        # Otherwise use normal threshold
+        return False
+    
+    def _is_likely_self_speech(self, text):
+        """Check if recognized text is likely to be the assistant's own speech"""
+        if not text:
+            return False
+            
+        # Check against recent recognitions for exact or very similar matches
+        text_lower = text.lower().strip()
+        
+        # More careful checking of substring matches to avoid filtering user wake words
+        # Skip filtering for wake words like "hello maxwell"
+        wake_words = [self.wake_word] if self.wake_word else []
+        if any(wake_word in text_lower for wake_word in wake_words):
+            # Don't filter wake words when not in conversation
+            if not self.in_conversation:
+                logger.info(f"Wake word detected in '{text_lower}', not filtering")
+                return False
+        
+        # Check for exact matches which are very likely to be self-speech
+        for recent_text in self.recent_recognitions:
+            recent_lower = recent_text.lower().strip()
+            
+            # Exact match - definitely self-speech
+            if text_lower == recent_lower:
+                logger.info(f"Detected exact self-speech match: '{text_lower}'")
+                return True
+                
+            # Substring match - only if significant overlap and not just wake word
+            if text_lower in recent_lower or recent_lower in text_lower:
+                # Only if the substring is significant AND not a simple wake word/greeting
+                # Calculate string similarity as a ratio of common chars using sets
+                text_set = set(text_lower)
+                recent_set = set(recent_lower)
+                common_chars = len(text_set.intersection(recent_set))
+                min_length = min(len(text_lower), len(recent_lower))
+                
+                # More conservative substring matching
+                if len(text_lower) > 10 and len(recent_lower) > 10 and common_chars > 7:
+                    logger.info(f"Detected significant self-speech overlap: '{text_lower}' vs '{recent_lower}'")
+                    return True
+                    
+        # Check for common self-speech patterns when the assistant has recently spoken
+        if time.time() < self.speaking_end_time + 2.0:  # Within 2 seconds of speaking
+            # Common patterns that might indicate echo/self-speech
+            # Be more specific with patterns to avoid filtering legitimate commands
+            self_speech_patterns = [
+                "i'm sorry", "thank you", "you're welcome", 
+                "is there anything else"
+            ]
+            
+            for pattern in self_speech_patterns:
+                if pattern in text_lower:
+                    logger.info(f"Detected specific self-speech pattern: '{pattern}' in '{text_lower}'")
+                    return True
+            
+            # For very short phrases, check for common filler words only if they appear alone
+            if len(text_lower.split()) <= 2:
+                filler_words = ["okay", "alright", "yes", "hello", "bye", "sure"]
+                if text_lower in filler_words:
+                    logger.info(f"Detected short filler self-speech: '{text_lower}'")
+                    return True
+        
+        return False
+    
+    def start(self, wake_word=None, interrupt_word=None):
+        """Start the audio processing"""
+        if self.processing_thread and self.processing_thread.is_alive():
+            logger.warning("StreamingAudioManager is already running")
+            return
+            
+        self.wake_word = wake_word.lower() if wake_word else None
+        self.interrupt_word = interrupt_word.lower() if interrupt_word else None
+        logger.info(f"Starting StreamingAudioManager with wake_word='{self.wake_word}', interrupt_word='{self.interrupt_word}'")
+        print(f"🎤 Starting speech recognition with wake word: '{self.wake_word}'")
+        
+        try:
+            # Reset stop flag
+            self.should_stop = False
+            self.running = True
+            
+            # Start audio processing thread
+            logger.info("Starting audio processing thread...")
+            self.processing_thread = threading.Thread(
+                target=self._processing_thread_func,
+                daemon=True
+            )
+            self.processing_thread.start()
+            
+            # Start speech processing thread
+            logger.info("Starting speech processing thread...")
+            self.speech_processing_thread = threading.Thread(
+                target=self._speech_processing_thread_func,
+                daemon=True
+            )
+            self.speech_processing_thread.start()
+            
+            logger.info("StreamingAudioManager started successfully")
+            print("✅ Speech recognition started successfully")
             
         except Exception as e:
-            logger.error(f"Error recording audio: {e}")
+            logger.error(f"Error starting StreamingAudioManager: {e}")
             logger.error(traceback.format_exc())
-            return None
+            print(f"❌ Failed to start speech recognition: {str(e)}")
+            self.running = False
+            raise
+    
+    def stop(self):
+        """Stop the audio processing"""
+        logger.info("Stopping StreamingAudioManager...")
+        print("🛑 Stopping speech recognition...")
+        
+        # Signal threads to stop
+        self.should_stop = True
+        self.running = False
+        logger.info("Set should_stop flag to True")
+        
+        # Wait for threads to terminate
+        if self.processing_thread and self.processing_thread.is_alive():
+            logger.info("Waiting for processing thread to stop...")
+            self.processing_thread.join(timeout=2)
+            
+            if self.processing_thread.is_alive():
+                logger.warning("Processing thread did not stop within timeout")
+        
+        if self.speech_processing_thread and self.speech_processing_thread.is_alive():
+            logger.info("Waiting for speech processing thread to stop...")
+            self.speech_processing_thread.join(timeout=2)
+            
+            if self.speech_processing_thread.is_alive():
+                logger.warning("Speech processing thread did not stop within timeout")
+        
+        # Clean up PyAudio
+        try:
+            self.p.terminate()
+        except:
+            pass
+            
+        # Remove temporary files
+        if os.path.exists(self.temp_dir):
+            for file in os.listdir(self.temp_dir):
+                try:
+                    os.remove(os.path.join(self.temp_dir, file))
+                except:
+                    pass
+            try:
+                os.rmdir(self.temp_dir)
+            except:
+                pass
+                
+        logger.info("StreamingAudioManager stopped")
     
     def _save_audio(self, audio_data, filename):
         """Save audio data to WAV file"""
@@ -353,9 +733,6 @@ class StreamingAudioManager:
                     logger.debug("Sphinx recognition failed or not available")
                     pass
                 
-                print("❓ Couldn't understand what you said")
-                return None
-                
             except sr.RequestError as e:
                 logger.error(f"Recognition error: {e}")
                 print(f"⚠️ Recognition service error: {e}")
@@ -383,6 +760,11 @@ class StreamingAudioManager:
     def _process_speech(self, text):
         """Process recognized speech"""
         if not text or self.should_stop:
+            return
+            
+        # Check if this is likely the assistant's own speech
+        if self._is_likely_self_speech(text):
+            logger.info(f"Ignoring likely self-speech: '{text}'")
             return
             
         text_lower = text.lower()
@@ -415,6 +797,10 @@ class StreamingAudioManager:
         
         # Process regular speech if in conversation
         logger.info(f"Processing speech in conversation mode: '{text}'")
+        
+        # Add to recent recognitions
+        self.recent_recognitions.append(text)
+        
         if self.on_speech_recognized:
             logger.info("Calling speech recognized callback")
             self.on_speech_recognized(text)
@@ -427,101 +813,58 @@ class StreamingAudioManager:
             return False
             
         text_lower = text.lower()
+        wake_word_lower = self.wake_word.lower()
         
         # Exact match
-        if self.wake_word in text_lower:
-            logger.info(f"Wake word exact match: '{self.wake_word}' in '{text_lower}'")
+        if wake_word_lower in text_lower:
+            logger.info(f"Wake word exact match: '{wake_word_lower}' in '{text_lower}'")
             return True
             
-        # Partial match (e.g., "hey max" instead of "hey maxwell")
-        wake_parts = self.wake_word.split()
+        # Fuzzy matching for wake words
+        # Split wake word and input into individual words
+        wake_parts = wake_word_lower.split()
+        text_parts = text_lower.split()
+        
         if len(wake_parts) > 1:
-            # Check if the first word and part of the second word match
-            if wake_parts[0] in text_lower and wake_parts[1][:3] in text_lower:
-                logger.info(f"Wake word partial match: '{wake_parts[0]}' and '{wake_parts[1][:3]}' in '{text_lower}'")
-                return True
+            # For multi-word wake phrases like "hey maxwell" or "hello maxwell"
+            # Match if the name part is present or a close match
+            if len(wake_parts) >= 2 and len(text_parts) >= 1:
+                # The second part (name) is often the most important
+                name_part = wake_parts[-1]  # e.g. "maxwell" in "hey maxwell"
                 
+                # Check for exact name match
+                if name_part in text_parts:
+                    logger.info(f"Wake word name match: '{name_part}' in {text_parts}")
+                    return True
+                
+                # Check for partial match of name (e.g. "max" instead of "maxwell")
+                for part in text_parts:
+                    # If text contains first part of name (min 3 chars)
+                    if len(part) >= 3 and len(name_part) >= 3:
+                        if part[:3] == name_part[:3]:
+                            logger.info(f"Wake word partial match: '{part}' matches start of '{name_part}'")
+                            return True
+                            
+                        # Or if name contains first part of text (min 3 chars)
+                        if name_part[:3] == part[:3]:
+                            logger.info(f"Wake word partial match: '{name_part}' matches start of '{part}'")
+                            return True
+        
+        # For single word wake words, be more lenient
+        elif len(wake_parts) == 1:
+            wake_word = wake_parts[0]
+            
+            # Check for partial matches
+            for word in text_parts:
+                # Match if at least half the wake word matches
+                min_match_len = max(3, len(wake_word) // 2)
+                if len(wake_word) >= min_match_len and len(word) >= min_match_len:
+                    if wake_word[:min_match_len] == word[:min_match_len]:
+                        logger.info(f"Wake word partial match: '{word}' start matches '{wake_word}'")
+                        return True
+                        
         return False
-    
-    def start(self, wake_word=None, interrupt_word=None):
-        """Start the audio processing"""
-        if self.processing_thread and self.processing_thread.is_alive():
-            logger.warning("StreamingAudioManager is already running")
-            return
-            
-        self.wake_word = wake_word.lower() if wake_word else None
-        self.interrupt_word = interrupt_word.lower() if interrupt_word else None
-        logger.info(f"Starting StreamingAudioManager with wake_word='{self.wake_word}', interrupt_word='{self.interrupt_word}'")
-        print(f"🎤 Starting speech recognition with wake word: '{self.wake_word}'")
-        
-        try:
-            # Reset stop flag
-            self.should_stop = False
-            self.running = True
-            
-            # Start processing thread
-            logger.info("Starting audio processing thread...")
-            self.processing_thread = threading.Thread(
-                target=self._processing_thread_func,
-                daemon=True
-            )
-            self.processing_thread.start()
-            
-            logger.info("StreamingAudioManager started successfully")
-            print("✅ Speech recognition started successfully")
-            
-        except Exception as e:
-            logger.error(f"Error starting StreamingAudioManager: {e}")
-            logger.error(traceback.format_exc())
-            print(f"❌ Failed to start speech recognition: {str(e)}")
-            self.running = False
-            raise
-    
-    def stop(self):
-        """Stop the audio processing"""
-        logger.info("Stopping StreamingAudioManager...")
-        print("🛑 Stopping speech recognition...")
-        
-        if not self.processing_thread or not self.processing_thread.is_alive():
-            logger.info("No active processing thread to stop")
-            return
-            
-        # Signal thread to stop
-        self.should_stop = True
-        self.running = False
-        logger.info("Set should_stop flag to True")
-        
-        # Wait for thread to terminate
-        logger.info("Waiting for processing thread to stop...")
-        self.processing_thread.join(timeout=2)
-        
-        if self.processing_thread.is_alive():
-            logger.warning("Processing thread did not stop within timeout, continuing anyway")
-            print("⚠️ Processing thread did not stop cleanly (timeout)")
-        else:
-            logger.info("Processing thread stopped successfully")
-            print("✅ Processing thread stopped successfully")
-        
-        # Clean up PyAudio
-        try:
-            self.p.terminate()
-        except:
-            pass
-            
-        # Remove temporary files
-        if os.path.exists(self.temp_dir):
-            for file in os.listdir(self.temp_dir):
-                try:
-                    os.remove(os.path.join(self.temp_dir, file))
-                except:
-                    pass
-            try:
-                os.rmdir(self.temp_dir)
-            except:
-                pass
-                
-        logger.info("StreamingAudioManager stopped")
-    
+
     def get_debug_info(self):
         """Get debug information about the audio manager"""
         return {
@@ -531,13 +874,9 @@ class StreamingAudioManager:
             "recognition_count": self.recognition_count,
             "energy_threshold": self.energy_threshold,
             "recognition_attempts": self.recognition_attempts,
-            "recognition_successes": self.recognition_successes
+            "recognition_successes": self.recognition_successes,
+            "buffer_size": len(self.speech_buffer) if hasattr(self, 'speech_buffer') else 0
         }
-    
-    def pause_listening(self, pause=True):
-        """Pause or resume audio processing"""
-        self.pause_for_speaking = pause
-        logger.debug(f"Audio processing {'paused' if pause else 'resumed'}")
     
     def set_debug_mode(self, enabled=True):
         """Enable or disable debug mode for more verbose audio diagnostics"""
@@ -595,6 +934,23 @@ class StreamingAudioManager:
             logger.debug(f"Error playing sound: {e}")
             # Silently fail if sound can't be played
             pass
+    
+    # Backward compatibility method
+    def pause_listening(self, pause=True):
+        """
+        DEPRECATED - Backward compatibility method
+        Use set_assistant_speaking instead for adjusting thresholds
+        """
+        logger.warning("pause_listening is deprecated, use set_assistant_speaking instead")
+        # No-op - we don't pause recording anymore, just adjust thresholds
+    
+    def _record_audio(self):
+        """
+        DEPRECATED - Kept for backwards compatibility
+        Use the continuous recording in _processing_thread_func instead
+        """
+        logger.warning("_record_audio called directly - this method is deprecated")
+        return None
 
 class StreamingMaxwell:
     def __init__(self, config):
@@ -628,6 +984,15 @@ class StreamingMaxwell:
         else:
             # System TTS (platform specific)
             self.tts = TextToSpeech(voice=tts_voice, speed=tts_speed, config=config)
+            
+            # Add callbacks for speech state
+            if hasattr(self.tts, '_is_speaking'):
+                # Add speech start/stop callbacks if supported
+                logger.info("Adding speech start/stop callbacks")
+                
+                # These will be set after audio_manager is created
+                self.tts.on_speaking_started = None
+                self.tts.on_speaking_stopped = None
         
         # Initialize keyboard handler for space bar interruption
         logger.info("Initializing keyboard handler...")
@@ -683,6 +1048,24 @@ class StreamingMaxwell:
             
         # Process the command
         self.handle_query(text)
+    
+    def _on_speaking_started(self):
+        """Callback for when the assistant starts speaking"""
+        logger.info("Assistant started speaking - adjusting energy threshold")
+        self.speaking = True
+        # Adjust the energy threshold to avoid self-triggering
+        # This doesn't stop the mic from listening, just raises the threshold
+        if hasattr(self.audio_manager, 'set_assistant_speaking'):
+            self.audio_manager.set_assistant_speaking(True)
+    
+    def _on_speaking_stopped(self):
+        """Callback for when the assistant stops speaking"""
+        logger.info("Assistant stopped speaking - restoring energy threshold")
+        self.speaking = False
+        # Restore the energy threshold to normal level
+        # The mic has been listening the whole time, just with a higher threshold
+        if hasattr(self.audio_manager, 'set_assistant_speaking'):
+            self.audio_manager.set_assistant_speaking(False)
     
     def signal_handler(self, sig, frame):
         """Handle interrupt signals"""
@@ -744,11 +1127,28 @@ class StreamingMaxwell:
             # Play a beep sound when Maxwell starts speaking
             self._play_sound(frequency=900, duration=70)  # Medium-pitched beep
             
-            # Pause audio processing to avoid self-listening
-            if hasattr(self.audio_manager, 'pause_listening'):
-                self.audio_manager.pause_listening(True)
+            # Tell audio manager that we're speaking to adjust threshold
+            if hasattr(self.audio_manager, 'set_assistant_speaking'):
+                self.audio_manager.set_assistant_speaking(True)
                 
-            # Add a small delay to ensure audio processing is fully paused
+                # Add only distinctive phrases to the self-speech filter
+                # Don't add greetings, wake word responses, or other common phrases
+                # that might filter out legitimate user commands
+                if hasattr(self.audio_manager, 'recent_recognitions'):
+                    # Skip adding very short responses or common responses to the filter
+                    common_phrases = ["yes", "hello", "hi", "hey", "okay", "sure", 
+                                     "yes?", "I'm listening", "I'm here", "go ahead"]
+                    
+                    if len(text.strip()) > 8 and not any(text.lower().startswith(phrase.lower()) for phrase in common_phrases):
+                        # Split long responses into shorter phrases
+                        sentences = re.split(r'[.!?]\s+', text)
+                        for sentence in sentences:
+                            # Only add substantial sentences, not simple acknowledgments
+                            if sentence and len(sentence.strip()) > 10:
+                                self.audio_manager.recent_recognitions.append(sentence.strip())
+                                logger.debug(f"Added to speech filter: '{sentence.strip()}'")
+                
+            # Add a small delay to ensure thresholds are adjusted
             time.sleep(0.2)
                 
             # Use direct audio playback - will be stopped by space bar handler
@@ -761,8 +1161,8 @@ class StreamingMaxwell:
             # Play a beep when Maxwell finishes speaking normally
             self._play_sound(frequency=850, duration=70)  # Medium-pitched beep
             
-            # Add a longer pause after speaking to avoid cutting off and prevent immediate listening
-            time.sleep(0.5)
+            # Add a shorter pause after speaking to avoid cutting off
+            time.sleep(0.3)
             
         except KeyboardInterrupt:
             # Handle Ctrl+C directly during speech
@@ -775,15 +1175,15 @@ class StreamingMaxwell:
             logger.error(f"Error in speak: {e}")
             logger.error(traceback.format_exc())
         finally:
-            # Resume audio processing
-            if hasattr(self.audio_manager, 'pause_listening'):
-                self.audio_manager.pause_listening(False)
+            # Restore normal energy threshold
+            if hasattr(self.audio_manager, 'set_assistant_speaking'):
+                self.audio_manager.set_assistant_speaking(False)
                 
             # Clear speaking flag
             self.speaking = False
             
             # Log that speaking has finished
-            logger.debug("Speaking completed, listening resumed")
+            logger.debug("Speaking completed, energy threshold restored")
     
     def handle_query(self, query):
         """Handle a user query using MCP tools when possible"""
@@ -1038,6 +1438,12 @@ class StreamingMaxwell:
                 # Set callbacks
                 self.audio_manager.on_speech_detected = self._on_speech_detected
                 self.audio_manager.on_speech_recognized = self._on_speech_recognized
+                
+                # Connect the speech callbacks if available
+                if hasattr(self.tts, 'on_speaking_started'):
+                    self.tts.on_speaking_started = self._on_speaking_started
+                    self.tts.on_speaking_stopped = self._on_speaking_stopped
+                    logger.info("Connected speech state callbacks")
                 
             # Start the audio manager
             print(f"🎤 Listening for wake word: '{self.wake_word}'")
