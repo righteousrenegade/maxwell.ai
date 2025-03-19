@@ -27,6 +27,10 @@ class KeyboardHandler:
         self.thread = None
         self.platform = platform.system()
         
+        # Add debounce mechanism to prevent phantom keypresses
+        self.last_keypress_time = 0
+        self.debounce_interval = 1.0  # 1 second debounce interval
+        
         # Import platform-specific modules
         if self.platform == "Windows":
             try:
@@ -98,9 +102,18 @@ class KeyboardHandler:
                 key = self.msvcrt.getch()
                 # Space key (32 in ASCII)
                 if key == b' ':
-                    logger.info("Space key pressed - interrupting speech")
-                    if self.tts and hasattr(self.tts, 'stop'):
-                        self.tts.stop()
+                    current_time = time.time()
+                    # Check if enough time has passed since the last keypress
+                    if current_time - self.last_keypress_time > self.debounce_interval:
+                        logger.info("Space key pressed - interrupting speech")
+                        if self.tts and hasattr(self.tts, 'stop'):
+                            self.tts.stop()
+                        self.last_keypress_time = current_time
+                        
+                        # Flush any pending input to avoid phantom key presses
+                        self._flush_input_buffer()
+                    else:
+                        logger.info(f"Ignoring potential phantom space keypress (within debounce interval)")
                     
             # Sleep to avoid high CPU usage
             time.sleep(0.1)
@@ -126,9 +139,18 @@ class KeyboardHandler:
                     key = self.sys.stdin.read(1)
                     # Space key
                     if key == ' ':
-                        logger.info("Space key pressed - interrupting speech")
-                        if self.tts and hasattr(self.tts, 'stop'):
-                            self.tts.stop()
+                        current_time = time.time()
+                        # Check if enough time has passed since the last keypress
+                        if current_time - self.last_keypress_time > self.debounce_interval:
+                            logger.info("Space key pressed - interrupting speech")
+                            if self.tts and hasattr(self.tts, 'stop'):
+                                self.tts.stop()
+                            self.last_keypress_time = current_time
+                            
+                            # Flush any pending input to avoid phantom key presses
+                            self._flush_input_buffer()
+                        else:
+                            logger.info(f"Ignoring potential phantom space keypress (within debounce interval)")
                 
                 # Sleep to avoid high CPU usage
                 time.sleep(0.1)
@@ -137,4 +159,19 @@ class KeyboardHandler:
             logger.error(f"Error in Unix keyboard handler: {e}")
         finally:
             # Restore terminal settings
-            self.termios.tcsetattr(fd, self.termios.TCSANOW, old_settings) 
+            self.termios.tcsetattr(fd, self.termios.TCSANOW, old_settings)
+    
+    def _flush_input_buffer(self):
+        """Flush any pending input in the buffer to prevent phantom keypresses."""
+        logger.debug("Flushing input buffer")
+        try:
+            if self.platform == "Windows" and self.msvcrt:
+                # Flush the Windows console input buffer
+                while self.msvcrt.kbhit():
+                    self.msvcrt.getch()
+            elif self.termios:
+                # Flush the Unix stdin buffer
+                self.termios.tcflush(self.sys.stdin.fileno(), self.termios.TCIOFLUSH)
+        except Exception as e:
+            logger.error(f"Error flushing input buffer: {e}")
+            # Continue even if flushing fails 

@@ -76,7 +76,7 @@ class StreamingAudioManager:
         self.mic_index = mic_index
         self.energy_threshold = energy_threshold
         self.default_energy_threshold = energy_threshold
-        self.speaking_energy_threshold = energy_threshold * 2.5  # Increased ratio to better filter self-speech
+        self.speaking_energy_threshold = energy_threshold * 3.0  # Increased ratio to better filter self-speech
         self.running = False
         self.in_conversation = False
         
@@ -126,10 +126,11 @@ class StreamingAudioManager:
         
         # Track speaking state with additional delay
         self.speaking_end_time = 0
-        self.post_speaking_delay = 1.0  # Additional delay after speaking to avoid self-triggering
+        self.post_speaking_delay = 1.5  # Increased delay after speaking to avoid self-triggering
         
         # Recent patterns detection to avoid self-triggering
         self.recent_recognitions = collections.deque(maxlen=5)  # Store recent recognitions
+        self.self_speech_filter = []  # Initialize self_speech_filter as an empty list
         
         # Audio characteristics tracking for self-speech detection
         self.audio_stats = {
@@ -140,6 +141,12 @@ class StreamingAudioManager:
             },
             "last_spoken_time": 0
         }
+        
+        # Anti-feedback measures
+        self.consecutive_recognitions = 0
+        self.last_recognition_time = 0
+        self.feedback_detection_window = 5.0  # seconds
+        self.max_consecutive_recognitions = 3
         
         # List available microphones
         self._list_microphones()
@@ -244,6 +251,19 @@ class StreamingAudioManager:
         assistant_avg_volume = np.mean(self.audio_stats["assistant_speech"]["volume_avg"])
         assistant_peak_volume = np.mean(self.audio_stats["assistant_speech"]["volume_peak"])
         
+        # Check if the volume characteristics are very close to assistant speech
+        # This is a stronger check for when the assistant is currently speaking
+        if self.is_assistant_speaking:
+            # During speaking, if volume levels are similar, likely self-speech
+            vol_ratio = stats["volume_avg"] / assistant_avg_volume if assistant_avg_volume > 0 else 1.0
+            peak_ratio = stats["volume_peak"] / assistant_peak_volume if assistant_peak_volume > 0 else 1.0
+            
+            # If volume characteristics are within 30% of assistant speech, likely self-speech
+            if 0.7 < vol_ratio < 1.3 and 0.7 < peak_ratio < 1.3:
+                logger.info(f"Self-speech detected during speaking by volume similarity - " +
+                          f"vol_ratio={vol_ratio:.2f}, peak_ratio={peak_ratio:.2f}")
+                return True
+        
         # Volume similarity check
         volume_similarity = abs(stats["volume_avg"] - assistant_avg_volume) / assistant_avg_volume if assistant_avg_volume > 0 else 1.0
         peak_similarity = abs(stats["volume_peak"] - assistant_peak_volume) / assistant_peak_volume if assistant_peak_volume > 0 else 1.0
@@ -281,7 +301,7 @@ class StreamingAudioManager:
                         f"probability={self_speech_probability:.2f}")
         
         # Higher threshold during and just after speaking - more permissive thresholds
-        threshold = 0.65 if self._should_use_elevated_threshold() else 0.80
+        threshold = 0.55 if self._should_use_elevated_threshold() else 0.80
         
         return self_speech_probability > threshold
     
@@ -293,16 +313,35 @@ class StreamingAudioManager:
         self.listen_count = 0
         last_stats_collect_time = 0
         
+        # VAD (Voice Activity Detection) window
+        vad_window = []
+        vad_window_size = 20  # Number of frames to keep in the VAD window
+        
         # Open a continuous microphone stream
         try:
-            stream = self.p.open(
-                format=self.FORMAT,
-                channels=self.CHANNELS,
-                rate=self.RATE,
-                input=True,
-                frames_per_buffer=self.CHUNK,
-                input_device_index=self.mic_index
-            )
+            # Initialize the stream with more robust error handling
+            try:
+                logger.info("Opening microphone stream...")
+                stream = self.p.open(
+                    format=self.FORMAT,
+                    channels=self.CHANNELS,
+                    rate=self.RATE,
+                    input=True,
+                    frames_per_buffer=self.CHUNK,
+                    input_device_index=self.mic_index
+                )
+                
+                # Flush initial buffer to prevent stale data
+                logger.info("Flushing initial microphone buffer...")
+                for _ in range(5):  # Read a few chunks to clear any stale data
+                    stream.read(self.CHUNK, exception_on_overflow=False)
+                time.sleep(0.1)  # Short pause after flushing
+                
+                logger.info("Microphone stream opened successfully")
+            except Exception as e:
+                logger.error(f"Error opening microphone stream: {e}")
+                logger.error(traceback.format_exc())
+                raise
             
             # Buffer to collect audio when above threshold
             frames = []
@@ -311,6 +350,9 @@ class StreamingAudioManager:
             max_silent_frames = int(self.RATE / self.CHUNK * 1.5)  # 1.5 seconds of silence
             recording_start = 0
             max_record_time = self.RECORD_SECONDS
+            last_speaking_state = False
+            last_keypress_time = time.time()
+            min_keypress_interval = 1.0  # Minimum time between keypresses
             
             while not self.should_stop:
                 self.listen_count += 1
@@ -322,7 +364,13 @@ class StreamingAudioManager:
                         print("👂 Listening for commands...")
                 
                 # Always read from microphone
-                data = stream.read(self.CHUNK, exception_on_overflow=False)
+                try:
+                    data = stream.read(self.CHUNK, exception_on_overflow=False)
+                except Exception as read_error:
+                    logger.error(f"Error reading from microphone: {read_error}")
+                    # Try to recover by sleeping briefly
+                    time.sleep(0.1)
+                    continue
                 
                 # Convert to numpy array
                 audio_data = np.frombuffer(data, dtype=np.int16)
@@ -330,6 +378,38 @@ class StreamingAudioManager:
                 # Get current volume level
                 volume = np.abs(audio_data).mean()
                 self.last_volume = volume
+                
+                # Add to voice activity detection window
+                vad_window.append(volume)
+                if len(vad_window) > vad_window_size:
+                    vad_window.pop(0)
+                
+                # Calculate VAD statistics
+                if len(vad_window) >= 5:  # Need some minimum history
+                    avg_volume = np.mean(vad_window)
+                    std_volume = np.std(vad_window)
+                    
+                    # Check for feedback loop pattern (consistent volumes with low variation)
+                    if self.is_assistant_speaking and std_volume < avg_volume * 0.15:
+                        # Very consistent volume during speaking likely indicates feedback
+                        if std_volume > 0 and avg_volume > self.energy_threshold * 0.8:
+                            logger.warning(f"Possible feedback loop detected: consistent volume with low variation")
+                            logger.warning(f"avg={avg_volume:.1f}, std={std_volume:.1f}, ratio={std_volume/avg_volume:.3f}")
+                            # Skip this frame to avoid feedback
+                            continue
+                
+                # Check if speaking state changed - this will help us reset recording when speaking starts
+                if self.is_assistant_speaking != last_speaking_state:
+                    if self.is_assistant_speaking:
+                        logger.debug("Speaking state changed to speaking - resetting any ongoing recording")
+                        # Reset recording if we just started speaking
+                        if is_recording:
+                            is_recording = False
+                            frames = []
+                            silent_frames = 0
+                        # Clear VAD window when starting to speak
+                        vad_window = []
+                    last_speaking_state = self.is_assistant_speaking
                 
                 # Collect audio statistics when assistant is speaking
                 current_time = time.time()
@@ -359,15 +439,34 @@ class StreamingAudioManager:
                     # Normal thresholds during conversation
                     current_threshold = self.speaking_energy_threshold if self._should_use_elevated_threshold() else self.energy_threshold
                 
+                # If speaking and we detect a sudden very loud sound, it might be the user interrupting
+                if self.is_assistant_speaking and volume > self.speaking_energy_threshold * 2.0:
+                    logger.info(f"Detected potential interruption (loud sound while speaking): volume={volume:.1f}")
+                
                 if volume > current_threshold:
                     # If we weren't recording before, start a new recording
                     if not is_recording:
-                        is_recording = True
-                        frames = [data]  # Start with this chunk
-                        recording_start = time.time()
-                        logger.debug(f"Started recording (volume: {volume:.1f}, threshold: {current_threshold})")
-                        # Only show audio detection if not too frequent
-                        if self.listen_count % 5 == 0:
+                        # If speaking, apply additional validation
+                        if self.is_assistant_speaking:
+                            # When assistant is speaking, we want to be more sure it's not picking up itself
+                            # Only start recording if the volume is significantly higher
+                            if volume > current_threshold * 1.5:
+                                # Additional VAD check - ensure the volume pattern indicates real speech
+                                if len(vad_window) >= 5 and not self._is_likely_feedback(vad_window):
+                                    is_recording = True
+                                    frames = [data]  # Start with this chunk
+                                    recording_start = time.time()
+                                    logger.debug(f"Started recording while speaking (higher volume: {volume:.1f}, threshold: {current_threshold})")
+                                else:
+                                    logger.debug(f"Rejecting audio - likely feedback pattern detected")
+                        else:
+                            is_recording = True
+                            frames = [data]  # Start with this chunk
+                            recording_start = time.time()
+                            logger.debug(f"Started recording (volume: {volume:.1f}, threshold: {current_threshold})")
+                            
+                        # Only show audio detection if not too frequent and we started recording
+                        if is_recording and self.listen_count % 5 == 0:
                             print("🔊 Sound detected...")
                     else:
                         # Continue recording
@@ -381,6 +480,14 @@ class StreamingAudioManager:
                         
                         # Check if we've been silent long enough to stop recording
                         if silent_frames > max_silent_frames:
+                            # If we were recording but never broke threshold by much, it might be noise
+                            if len(frames) < 10:
+                                logger.debug("Recording too short, likely noise - discarding")
+                                is_recording = False
+                                frames = []
+                                silent_frames = 0
+                                continue
+                                
                             # We've detected enough silence - process this audio segment
                             audio_data = b''.join(frames)
                             
@@ -389,7 +496,8 @@ class StreamingAudioManager:
                             
                             # For audio recorded during assistant speech, check if it's self-speech
                             # But be more cautious about filtering - we still want to process potential wake words
-                            if self.is_assistant_speaking:
+                            if self.is_assistant_speaking or time.time() < self.speaking_end_time:
+                                # When we're speaking or just stopped speaking, be very cautious
                                 # Check if this audio is likely self-speech by audio characteristics
                                 if self._is_audio_self_speech(audio_data):
                                     logger.info("Detected likely self-speech by audio characteristics, skipping")
@@ -420,7 +528,7 @@ class StreamingAudioManager:
                             should_process = True
                             
                             # Be more cautious about filtering while speaking
-                            if self.is_assistant_speaking:
+                            if self.is_assistant_speaking or time.time() < self.speaking_end_time:
                                 # Check if this audio is likely self-speech by audio characteristics
                                 if self._is_audio_self_speech(audio_data):
                                     logger.info("Detected likely self-speech by audio characteristics, skipping")
@@ -455,48 +563,159 @@ class StreamingAudioManager:
         logger.info("Audio processing thread stopped")
         print("🛑 Microphone listening stopped")
     
+    def _is_likely_feedback(self, vad_window):
+        """Analyze volume pattern to detect feedback loop patterns
+        
+        Feedback loops tend to have consistent volume patterns with low variation,
+        while natural speech has more variation in volume.
+        """
+        if len(vad_window) < 5:
+            return False
+            
+        # Calculate statistics on the volume window
+        mean_vol = np.mean(vad_window)
+        std_vol = np.std(vad_window)
+        
+        # Very consistent volume is suspicious especially if it's not very quiet
+        if mean_vol > self.energy_threshold * 0.5 and std_vol < mean_vol * 0.2:
+            logger.debug(f"Suspicious volume pattern: mean={mean_vol:.1f}, std={std_vol:.1f}, ratio={std_vol/mean_vol:.3f}")
+            return True
+            
+        return False
+    
     def _speech_processing_thread_func(self):
         """Separate thread that processes the speech buffer"""
         logger.info("Speech processing thread started")
         
+        last_processed_time = 0
+        min_processing_interval = 0.5  # Min seconds between processing to avoid feedback loops
+        
         while not self.should_stop:
-            # Check if there's anything in the buffer
-            audio_file = None
+            # Check for audio files in the buffer
             with self.speech_buffer_lock:
                 if self.speech_buffer:
+                    # Get the next file
                     audio_file = self.speech_buffer.pop(0)
+                else:
+                    audio_file = None
             
             if audio_file:
-                # Get current speaking state and elapsed time since speaking
-                process_immediately = True
-                time_since_speaking_stopped = time.time() - self.speaking_end_time
+                current_time = time.time()
                 
-                # Apply stricter filtering only if actually speaking (not after speaking)
-                # This allows wake words to be detected right after the assistant stops speaking
+                # Skip processing if we've processed audio too recently
+                if current_time - last_processed_time < min_processing_interval:
+                    logger.debug(f"Skipping processing - too soon after last process ({current_time - last_processed_time:.2f}s)")
+                    time.sleep(0.1)
+                    # Put back at the end of the queue if it's valid
+                    if os.path.exists(audio_file):
+                        with self.speech_buffer_lock:
+                            self.speech_buffer.append(audio_file)
+                    continue
+                
+                # Apply additional delays if needed
                 if self.is_assistant_speaking:
-                    logger.debug("Processing audio recorded while assistant was speaking - applying filtering")
-                    # Add a shorter delay for audio recorded while speaking
-                    logger.debug(f"Small delay before processing audio recorded during speech")
-                    time.sleep(0.4)  # Cut delay in half
+                    # While speaking, add more delay to avoid feedback
+                    delay_needed = 0.6
+                    logger.debug(f"Adding delay of {delay_needed}s because assistant is speaking")
+                    time.sleep(delay_needed)
+                elif current_time < self.speaking_end_time:
+                    # Just stopped speaking - add a shorter delay
+                    time_since_speaking = current_time - self.speaking_end_time
+                    if time_since_speaking < 0.5:  # Within 0.5s of speaking end
+                        delay_needed = 0.3
+                        logger.debug(f"Adding delay of {delay_needed}s after speaking")
+                        time.sleep(delay_needed)
                 
-                # Process this audio file if not filtered out
-                if process_immediately or not self.should_stop:
-                    text = self._recognize_speech(audio_file)
-                    
-                    if text:
-                        # Process the recognized speech
-                        self._process_speech(text)
-                    
-                # Remove the temp file after processing
+                # If we should stop, don't process this file
+                if self.should_stop:
+                    try:
+                        # Try to remove the audio file
+                        if os.path.exists(audio_file):
+                            os.remove(audio_file)
+                    except Exception as e:
+                        logger.error(f"Error removing audio file: {e}")
+                    break
+                
+                # Process the audio file
+                recognized_text = self._recognize_speech(audio_file)
+                
+                # Update the last processed time
+                last_processed_time = time.time()
+                
+                # Try to remove the audio file after processing
                 try:
                     os.remove(audio_file)
-                except:
-                    pass
-            else:
-                # No audio to process, sleep a bit
-                time.sleep(0.1)
+                except Exception as e:
+                    logger.error(f"Error removing audio file: {e}")
+                
+                # Skip if no text was recognized
+                if not recognized_text:
+                    continue
+                    
+                # Apply text-based filtration of self-speech
+                if self._is_likely_self_speech(recognized_text):
+                    if not self._check_wake_word(recognized_text):  # Only skip if it's not a wake word
+                        logger.info(f"Filtered out likely self-speech: '{recognized_text}'")
+                        continue
+                
+                # Check if this audio has the acoustic characteristics of self-speech
+                # This is an additional check that happens after text recognition
+                if self.is_assistant_speaking or time.time() < self.speaking_end_time + 1.0:
+                    # Only apply this check if we're speaking or just finished speaking
+                    if self._check_self_speech_by_timing(recognized_text):
+                        logger.warning(f"Detected probable self-speech based on timing: '{recognized_text}'")
+                        # Don't skip wake words even if they seem like self-speech
+                        if not self._check_wake_word(recognized_text):
+                            continue
+                
+                # Process the text
+                self._process_speech(recognized_text)
+            
+            # Small delay to prevent tight loops
+            time.sleep(0.1)
         
         logger.info("Speech processing thread stopped")
+    
+    def _check_self_speech_by_timing(self, text):
+        """Check if recognized text is likely to be self-speech based on timing and content patterns
+        
+        This uses a combination of timing (how soon after speaking), the text pattern,
+        and common indicators of self-speech that might not be in the text filter.
+        """
+        # If not speaking and not just finished speaking, it's unlikely to be self-speech
+        if not self.is_assistant_speaking and time.time() > self.speaking_end_time + 2.0:
+            return False
+            
+        # Check for very short texts that are common responses
+        text_lower = text.lower().strip()
+        common_responses = ["yes", "okay", "sure", "no", "thanks", "thank you", "hello", "hi", "hey"]
+        
+        # If it's a very common short response AND we just spoke, it's highly suspicious
+        if text_lower in common_responses and time.time() < self.speaking_end_time + 1.0:
+            return True
+            
+        # Check if the text contains any phrases from our self-speech log
+        # This is for cases where the exact text isn't in the filter
+        # but it's very similar to something we just said
+        time_since_speaking = time.time() - self.speaking_end_time
+        
+        if time_since_speaking < 1.5:  # Only check this for 1.5 seconds after speaking
+            # Check against recent recognitions instead of self_speech_filter
+            for phrase in self.recent_recognitions:
+                # For short texts, require a stronger match
+                if len(text_lower) < 10:
+                    if text_lower in phrase.lower() or phrase.lower() in text_lower:
+                        return True
+                # For longer texts, check for substantial overlap
+                else:
+                    # Calculate the length of the longest common substring
+                    # as a rough measure of similarity
+                    common_words = set(text_lower.split()).intersection(set(phrase.lower().split()))
+                    if common_words and len(common_words) >= 2:
+                        # If we share 2+ words AND we just spoke, it's suspicious
+                        return True
+        
+        return False
     
     def set_assistant_speaking(self, is_speaking):
         """Set whether the assistant is currently speaking to adjust thresholds"""
@@ -510,6 +729,9 @@ class StreamingAudioManager:
                 self.audio_stats["assistant_speech"]["volume_avg"] = self.audio_stats["assistant_speech"]["volume_avg"][-10:]
                 self.audio_stats["assistant_speech"]["volume_peak"] = self.audio_stats["assistant_speech"]["volume_peak"][-10:]
                 self.audio_stats["assistant_speech"]["spectrum_profile"] = self.audio_stats["assistant_speech"]["spectrum_profile"][-10:]
+            
+            # Reset feedback detection when we start speaking
+            self.consecutive_recognitions = 0
         else:
             # Set time to keep higher threshold for a short delay after speaking
             self.speaking_end_time = time.time() + self.post_speaking_delay
@@ -761,6 +983,34 @@ class StreamingAudioManager:
         """Process recognized speech"""
         if not text or self.should_stop:
             return
+        
+        current_time = time.time()
+        
+        # Detect potential feedback loop
+        if current_time - self.last_recognition_time < self.feedback_detection_window:
+            self.consecutive_recognitions += 1
+            logger.info(f"Consecutive recognition #{self.consecutive_recognitions} within {self.feedback_detection_window}s window")
+            
+            # If we're getting too many recognitions in a short time, it's likely a feedback loop
+            if self.consecutive_recognitions >= self.max_consecutive_recognitions:
+                logger.warning(f"Feedback loop detected! {self.consecutive_recognitions} recognitions in {self.feedback_detection_window}s")
+                print("⚠️ Feedback loop detected! Ignoring input for a short time...")
+                
+                # Increase thresholds temporarily
+                temp_threshold = self.energy_threshold * 3.5
+                logger.info(f"Temporarily increasing threshold to {temp_threshold} to break feedback loop")
+                self.energy_threshold = temp_threshold
+                self.speaking_energy_threshold = temp_threshold * 1.2
+                
+                # Reset after a delay
+                threading.Timer(2.0, self._reset_after_feedback_detection).start()
+                return
+        else:
+            # Reset consecutive count if it's been a while
+            self.consecutive_recognitions = 1
+        
+        # Update last recognition time
+        self.last_recognition_time = current_time
             
         # Check if this is likely the assistant's own speech
         if self._is_likely_self_speech(text):
@@ -951,6 +1201,14 @@ class StreamingAudioManager:
         """
         logger.warning("_record_audio called directly - this method is deprecated")
         return None
+
+    def _reset_after_feedback_detection(self):
+        """Reset thresholds after feedback detection"""
+        logger.info("Resetting thresholds after feedback detection")
+        self.energy_threshold = self.default_energy_threshold
+        self.speaking_energy_threshold = self.default_energy_threshold * 3.0
+        self.consecutive_recognitions = 0
+        print("✅ Listening resumed with normal sensitivity")
 
 class StreamingMaxwell:
     def __init__(self, config):

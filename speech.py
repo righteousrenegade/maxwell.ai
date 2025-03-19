@@ -204,21 +204,36 @@ class TextToSpeech:
             
     def stop(self):
         """Stop current speech"""
-        if self._is_speaking:
-            logger.info("Stopping TTS playback...")
-            sd.stop()
-            logger.info("TTS playback stopped")
-            
-            # Update speaking state
-            with self._speaking_lock:
-                self._is_speaking = False
-                
-            # Call the speaking stopped callback if it exists
-            if self.on_speaking_stopped:
+        # Use a lock to prevent multiple stop calls from interfering with each other
+        with self._speaking_lock:
+            # Only take action if we're actually speaking
+            if self._is_speaking:
+                logger.info("Stopping TTS playback...")
                 try:
-                    self.on_speaking_stopped()
+                    # Stop sounddevice playback
+                    sd.stop()
+                    logger.info("TTS playback stopped")
+                    
+                    # Update speaking state - must be done while holding lock
+                    self._is_speaking = False
+                    
+                    # Add small delay to ensure cleanup is complete
+                    time.sleep(0.1)
+                    
                 except Exception as e:
-                    logger.error(f"Error in on_speaking_stopped callback: {e}")
+                    logger.error(f"Error stopping TTS playback: {e}")
+                    # Still mark as not speaking even if error occurs
+                    self._is_speaking = False
+                
+                # Call the speaking stopped callback if it exists - still inside lock to prevent race conditions
+                if self.on_speaking_stopped:
+                    try:
+                        self.on_speaking_stopped()
+                    except Exception as e:
+                        logger.error(f"Error in on_speaking_stopped callback: {e}")
+            else:
+                # Log but don't take action if we're not speaking
+                logger.debug("Stop called but not currently speaking - ignoring")
             
     def is_speaking(self):
         """Check if currently speaking"""
