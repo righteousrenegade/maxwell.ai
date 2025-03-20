@@ -33,29 +33,6 @@ def load_yaml_config(config_path: str) -> Dict[str, Any]:
         logger.error(f"[CONFIG] ✗ Error loading YAML from {config_path}: {e}")
         return {}
 
-def load_env_file(env_path: str) -> Dict[str, str]:
-    """Load configuration from .env file"""
-    if not os.path.exists(env_path):
-        logger.warning(f"[CONFIG] .env file not found: {env_path}")
-        return {}
-        
-    env_vars = {}
-    try:
-        with open(env_path, 'r') as file:
-            for line in file:
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-                    
-                key, value = line.split('=', 1)
-                env_vars[key.strip()] = value.strip()
-                
-        logger.info(f"[CONFIG] ✓ Successfully loaded .env config from: {os.path.abspath(env_path)}")
-        return env_vars
-    except Exception as e:
-        logger.error(f"[CONFIG] ✗ Error loading .env from {env_path}: {e}")
-        return {}
-
 def load_config(yaml_path: Optional[str] = None, env_path: Optional[str] = None) -> Dict[str, Any]:
     """
     Load configuration from both YAML and .env files, with .env taking precedence
@@ -88,28 +65,6 @@ def load_config(yaml_path: Optional[str] = None, env_path: Optional[str] = None)
     for key in flat_config:
         config_sources[key] = f"YAML ({yaml_path})"
     
-    # Load .env file (higher precedence)
-    env_config = load_env_file(env_path)
-    
-    # Convert .env keys to match our flattened structure
-    for key, value in env_config.items():
-        # Handle special cases
-        normalized_key = key.lower()
-        if normalized_key == "openai_api_key":
-            flat_config["openai_api_key"] = value
-            config_sources["openai_api_key"] = f"ENV ({env_path})"
-        elif normalized_key == "openai_base_url":
-            flat_config["openai_base_url"] = value
-            config_sources["openai_base_url"] = f"ENV ({env_path})"
-        elif normalized_key == "llm_provider":
-            flat_config["llm_provider"] = value
-            config_sources["llm_provider"] = f"ENV ({env_path})"
-        elif normalized_key == "tts_model_path":
-            flat_config["tts_model_path"] = value
-            config_sources["tts_model_path"] = f"ENV ({env_path})"
-        elif normalized_key == "tts_voices_path":
-            flat_config["tts_voices_path"] = value
-            config_sources["tts_voices_path"] = f"ENV ({env_path})"
     
     # Also check actual environment variables (highest precedence)
     env_var_keys = {
@@ -147,6 +102,7 @@ def flatten_config(config: Dict[str, Any]) -> Dict[str, Any]:
     if "general" in config:
         for key, value in config["general"].items():
             flat_config[key] = value
+            logger.debug(f"[CONFIG] Added general.{key} = {value}")
             
     # LLM settings
     if "llm" in config:
@@ -183,6 +139,9 @@ def flatten_config(config: Dict[str, Any]) -> Dict[str, Any]:
             flat_config["tts_model_path"] = config["tts"]["model_path"]
         if "voices_path" in config["tts"]:
             flat_config["tts_voices_path"] = config["tts"]["voices_path"]
+    
+    # Final log of important settings
+    logger.debug(f"[CONFIG] Final use_mcp value in flat_config: {flat_config.get('use_mcp')}")
             
     return flat_config
 
@@ -207,6 +166,12 @@ def create_config_object(flat_config: Dict[str, Any]) -> Any:
             for key, value in config_dict.items():
                 setattr(self, key, value)
                 
+            # Ensure use_mcp is correctly set 
+            if 'use_mcp' in config_dict:
+                logger.debug(f"[CONFIG] Setting use_mcp explicitly to {config_dict['use_mcp']}")
+                self.use_mcp = bool(config_dict['use_mcp'])
+                logger.debug(f"[CONFIG] Verified use_mcp is now {self.use_mcp}")
+                
         def get(self, key, default=None):
             return getattr(self, key, default)
             
@@ -214,6 +179,7 @@ def create_config_object(flat_config: Dict[str, Any]) -> Any:
             return json.dumps({k: v for k, v in self.__dict__.items() if k != 'get'}, 
                               default=str, indent=2)
     
+        
     return ConfigObject(flat_config)
 
 # For demonstration/testing
