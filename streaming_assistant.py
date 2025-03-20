@@ -2087,24 +2087,99 @@ class StreamingMaxwell:
         # Set a flag that we can check in the main loop
         self.space_key_hit = True
         
-        # Try to stop TTS directly
+        # Try to stop TTS safely with multiple layers of protection
         try:
-            if hasattr(self, 'tts') and self.tts:
-                logger.info("=== SPACE KEY DEBUG: Stopping TTS during startup ===")
-                if hasattr(self.tts, 'stop'):
+            # First check if TTS attribute exists and is not None
+            if not hasattr(self, 'tts') or self.tts is None:
+                logger.warning("=== SPACE KEY DEBUG: No TTS object available to stop ===")
+                # Even without a TTS object, try to force stop any audio output
+                try:
+                    import sounddevice as sd
+                    sd.stop()
+                    logger.info("=== SPACE KEY DEBUG: Called sd.stop() directly (no TTS object) ===")
+                except Exception as sd_err:
+                    logger.error(f"=== SPACE KEY DEBUG: Error calling direct sd.stop(): {sd_err} ===")
+                return
+            
+            # Now we know self.tts exists and is not None
+            logger.info("=== SPACE KEY DEBUG: TTS object exists ===")
+            
+            # Check if it has a stop method
+            if not hasattr(self.tts, 'stop'):
+                logger.warning("=== SPACE KEY DEBUG: TTS object has no stop method ===")
+                # Try the direct sounddevice approach as fallback
+                try:
+                    import sounddevice as sd
+                    sd.stop()
+                    logger.info("=== SPACE KEY DEBUG: Called sd.stop() directly (no stop method) ===")
+                except Exception as sd_err:
+                    logger.error(f"=== SPACE KEY DEBUG: Error calling direct sd.stop(): {sd_err} ===")
+                return
+                
+            # We have a TTS object with a stop method, try to use it
+            logger.info("=== SPACE KEY DEBUG: Stopping TTS during startup ===")
+            
+            # Use a separate thread with timeout for extra safety
+            def safe_stop_thread():
+                try:
                     self.tts.stop()
-                logger.info("=== SPACE KEY DEBUG: TTS stopped during startup ===")
+                    logger.info("=== SPACE KEY DEBUG: TTS.stop() completed in thread ===")
+                except Exception as stop_err:
+                    logger.error(f"=== SPACE KEY DEBUG: Error in threaded TTS.stop(): {stop_err} ===")
+                    # Try as a last resort
+                    try:
+                        import sounddevice as sd
+                        sd.stop()
+                        logger.info("=== SPACE KEY DEBUG: Called sd.stop() as last resort ===")
+                    except Exception:
+                        pass
+            
+            # Create and start the thread
+            stop_thread = threading.Thread(target=safe_stop_thread)
+            stop_thread.daemon = True
+            stop_thread.start()
+            
+            # Wait with timeout
+            stop_thread.join(timeout=1.0)
+            if stop_thread.is_alive():
+                logger.warning("=== SPACE KEY DEBUG: TTS.stop() thread timed out ===")
+                # Try the direct approach as an additional fallback
+                try:
+                    import sounddevice as sd
+                    sd.stop()
+                    logger.info("=== SPACE KEY DEBUG: Called sd.stop() after thread timeout ===")
+                except Exception:
+                    pass
+            else:
+                logger.info("=== SPACE KEY DEBUG: TTS stopped successfully ===")
+            
         except Exception as e:
-            logger.error(f"=== SPACE KEY DEBUG: Error stopping TTS during startup: {e} ===")
+            logger.error(f"=== SPACE KEY DEBUG: Error in space key handler: {e} ===")
+            # As an absolute last resort, try to stop any audio playback directly
+            try:
+                import sounddevice as sd
+                sd.stop()
+                logger.info("=== SPACE KEY DEBUG: Called sd.stop() after exception ===")
+            except Exception:
+                pass
+        
+        # Mark the assistant as not speaking, regardless of what happened above
+        try:
+            if hasattr(self, 'audio_manager') and self.audio_manager:
+                self.audio_manager.set_assistant_speaking(False)
+                logger.info("=== SPACE KEY DEBUG: Reset assistant speaking state ===")
+        except Exception as am_err:
+            logger.error(f"=== SPACE KEY DEBUG: Error resetting speaking state: {am_err} ===")
         
         # Indicate that we've handled it
         logger.info("=== SPACE KEY DEBUG: Space key during startup handled safely ===")
         
-        # Play a sound to indicate interruption
+        # Play a sound to indicate interruption, but with extra protection
         try:
             self._play_sound(frequency=600, duration=120)
-        except Exception:
-            pass
+        except Exception as sound_err:
+            logger.error(f"=== SPACE KEY DEBUG: Error playing interrupt sound: {sound_err} ===")
+            # Don't let sound errors propagate
     
     def _play_listening_sound(self):
         """Play a sound to indicate we're listening"""

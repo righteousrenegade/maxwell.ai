@@ -359,6 +359,12 @@ class CommandExecutor:
         else:
             return "Please specify which search result you want details for, e.g., 'details search result 1'"
 
+    def _execute_search_command(self, args):
+        """Execute the search command by calling the search_web MCP tool"""
+        if not args:
+            return "Please specify what you want to search for."
+        return self._execute_mcp_tool("search_web", args)
+
     def show_help(self, args):
         """Show help text for available commands and tools"""
         logger.info(f"Showing help: {args}")

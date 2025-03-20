@@ -290,17 +290,35 @@ class KeyboardHandler:
         """Safely stop TTS with extra protection against exceptions"""
         try:
             logger.info("=== SPACE KEY DEBUG: _safe_stop_tts STARTED ===")
-            # Add extra checks
+            
+            # First check if TTS exists
             if self.tts is None:
                 logger.warning("TTS is None in _safe_stop_tts - nothing to stop")
                 logger.info("=== SPACE KEY DEBUG: _safe_stop_tts ENDED (tts is None) ===")
+                
+                # Try direct sounddevice stop as fallback
+                try:
+                    import sounddevice as sd
+                    sd.stop()
+                    logger.info("=== SPACE KEY DEBUG: Called sd.stop() directly when TTS is None ===")
+                except Exception as sd_err:
+                    logger.error(f"=== SPACE KEY DEBUG: Error in direct sd.stop() when TTS is None: {sd_err} ===")
                 return
             
             logger.info("=== SPACE KEY DEBUG: TTS object exists ===")
             
+            # Check if stop method exists
             if not hasattr(self.tts, 'stop'):
                 logger.warning("TTS has no stop method - cannot stop")
                 logger.info("=== SPACE KEY DEBUG: _safe_stop_tts ENDED (no stop method) ===")
+                
+                # Try direct sounddevice stop as fallback
+                try:
+                    import sounddevice as sd
+                    sd.stop()
+                    logger.info("=== SPACE KEY DEBUG: Called sd.stop() directly when no stop method ===")
+                except Exception as sd_err:
+                    logger.error(f"=== SPACE KEY DEBUG: Error in direct sd.stop() when no stop method: {sd_err} ===")
                 return
             
             logger.info("=== SPACE KEY DEBUG: TTS has stop method ===")
@@ -312,10 +330,39 @@ class KeyboardHandler:
                 except Exception as e:
                     logger.error(f"=== SPACE KEY DEBUG: Error checking is_speaking: {e} ===")
             
-            # Call in a protected way
-            logger.info("=== SPACE KEY DEBUG: About to call tts.stop() ===")
-            self.tts.stop()
-            logger.info("=== SPACE KEY DEBUG: tts.stop() completed successfully ===")
+            # Use a timeout approach to avoid blocking indefinitely
+            def stop_thread_func():
+                try:
+                    # Call in a protected way
+                    logger.info("=== SPACE KEY DEBUG: About to call tts.stop() in thread ===")
+                    self.tts.stop()
+                    logger.info("=== SPACE KEY DEBUG: tts.stop() completed successfully in thread ===")
+                except Exception as stop_err:
+                    logger.error(f"=== SPACE KEY DEBUG: ERROR in threaded tts.stop(): {stop_err} ===")
+                    # Try direct sounddevice stop as last resort 
+                    try:
+                        import sounddevice as sd
+                        sd.stop()
+                        logger.info("=== SPACE KEY DEBUG: Called sd.stop() after threaded stop error ===")
+                    except Exception:
+                        pass
+            
+            # Create and start the stop thread
+            stop_thread = threading.Thread(target=stop_thread_func)
+            stop_thread.daemon = True
+            stop_thread.start()
+            
+            # Wait with timeout
+            stop_thread.join(timeout=1.0)
+            if stop_thread.is_alive():
+                logger.warning("=== SPACE KEY DEBUG: Stop thread timed out after 1.0s ===")
+                # Try direct approach as fallback
+                try:
+                    import sounddevice as sd
+                    sd.stop()
+                    logger.info("=== SPACE KEY DEBUG: Called sd.stop() after thread timeout ===")
+                except Exception:
+                    pass
             
             # Add a delay to ensure the call completes
             try:
@@ -329,6 +376,16 @@ class KeyboardHandler:
                 if hasattr(self.tts, 'is_speaking'):
                     is_still_speaking = self.tts.is_speaking()
                     logger.info(f"=== SPACE KEY DEBUG: After stop, is_speaking: {is_still_speaking} ===")
+                    
+                    # If still speaking after stop attempt, try one more time with direct approach
+                    if is_still_speaking:
+                        logger.warning("=== SPACE KEY DEBUG: TTS still speaking after stop, trying direct approach ===")
+                        try:
+                            import sounddevice as sd
+                            sd.stop()
+                            logger.info("=== SPACE KEY DEBUG: Called sd.stop() when still speaking after stop ===")
+                        except Exception:
+                            pass
             except Exception as check_e:
                 logger.error(f"=== SPACE KEY DEBUG: Error checking speaking state after stop: {check_e} ===")
             
@@ -336,4 +393,12 @@ class KeyboardHandler:
         except Exception as e:
             logger.error(f"=== SPACE KEY DEBUG: ERROR in _safe_stop_tts: {e} ===")
             logger.error(f"=== SPACE KEY DEBUG: Error traceback: {e.__class__.__name__} ===")
+            
+            # Try direct sounddevice stop as ultimate fallback
+            try:
+                import sounddevice as sd
+                sd.stop()
+                logger.info("=== SPACE KEY DEBUG: Called sd.stop() after exception in _safe_stop_tts ===")
+            except Exception:
+                pass
             # Swallow exception completely 

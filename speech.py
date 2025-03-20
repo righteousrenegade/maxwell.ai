@@ -210,11 +210,68 @@ class TextToSpeech:
     def stop(self):
         """Stop current speech"""
         logger.info("=== TTS DEBUG: stop method STARTED ===")
+        
+        # First attempt: direct sounddevice stop without any locks
+        # This ensures something happens even if we encounter lock issues
         try:
-            # Use a lock to prevent multiple stop calls from interfering with each other
-            logger.info("=== TTS DEBUG: Attempting to acquire speaking lock ===")
-            with self._speaking_lock:
-                logger.info("=== TTS DEBUG: Speaking lock acquired ===")
+            logger.info("=== TTS DEBUG: Initial direct sd.stop() attempt ===")
+            sd.stop()
+            logger.info("=== TTS DEBUG: Initial direct sd.stop() succeeded ===")
+        except Exception as direct_e:
+            logger.error(f"=== TTS DEBUG: Initial direct sd.stop() failed: {direct_e} ===")
+            # Don't return here - keep trying other approaches
+        
+        try:
+            # Try with a timeout to prevent deadlocks on the speaking lock
+            lock_acquired = False
+            
+            # Use a separate thread for the lock acquisition to allow timeout
+            def acquire_lock_thread():
+                nonlocal lock_acquired
+                try:
+                    # Use a lock to prevent multiple stop calls from interfering with each other
+                    logger.info("=== TTS DEBUG: Attempting to acquire speaking lock ===")
+                    self._speaking_lock.acquire()
+                    lock_acquired = True
+                    logger.info("=== TTS DEBUG: Speaking lock acquired ===")
+                except Exception as lock_e:
+                    logger.error(f"=== TTS DEBUG: Error acquiring speaking lock: {lock_e} ===")
+            
+            # Create and start the lock thread
+            lock_thread = threading.Thread(target=acquire_lock_thread)
+            lock_thread.daemon = True
+            lock_thread.start()
+            
+            # Wait for lock with timeout
+            lock_thread.join(timeout=1.0)
+            
+            if not lock_acquired:
+                logger.error("=== TTS DEBUG: Failed to acquire speaking lock (timeout) ===")
+                # Try direct approach again since we couldn't get the lock
+                try:
+                    sd.stop()
+                    logger.info("=== TTS DEBUG: Called sd.stop() after lock timeout ===")
+                except Exception as sd_e:
+                    logger.error(f"=== TTS DEBUG: Error in sd.stop() after lock timeout: {sd_e} ===")
+                
+                # Force reset the speaking state even without the lock
+                self._is_speaking = False
+                logger.info("=== TTS DEBUG: Force reset speaking state without lock ===")
+                
+                # Try calling callbacks even without the lock
+                if self.on_speaking_stopped:
+                    try:
+                        logger.info("=== TTS DEBUG: Calling on_speaking_stopped without lock ===")
+                        self.on_speaking_stopped()
+                    except Exception as cb_e:
+                        logger.error(f"=== TTS DEBUG: Error in callback without lock: {cb_e} ===")
+                
+                # Then return - we've done our best without the lock
+                logger.info("=== TTS DEBUG: stop method completed (without lock) ===")
+                return
+                
+            # We have the lock, proceed with the normal flow
+            try:
                 # Only take action if we're actually speaking
                 if self._is_speaking:
                     logger.info("=== TTS DEBUG: Is speaking = True, proceeding with stop ===")
@@ -259,8 +316,15 @@ class TextToSpeech:
                 else:
                     # Log but don't take action if we're not speaking
                     logger.debug("=== TTS DEBUG: Stop called but not currently speaking - ignoring ===")
-            
-            logger.info("=== TTS DEBUG: About to release speaking lock ===")
+            finally:
+                # Always release the lock in the finally block
+                try:
+                    logger.info("=== TTS DEBUG: About to release speaking lock ===")
+                    self._speaking_lock.release()
+                    logger.info("=== TTS DEBUG: Speaking lock released successfully ===")
+                except Exception as release_e:
+                    logger.error(f"=== TTS DEBUG: Error releasing speaking lock: {release_e} ===")
+                    # The lock might not have been acquired or might already be released
         except Exception as outer_e:
             # Catch-all to prevent any possible crash
             logger.error(f"=== TTS DEBUG: Unexpected error in TTS.stop method: {outer_e} ===")

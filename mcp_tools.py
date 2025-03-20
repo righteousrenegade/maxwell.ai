@@ -287,6 +287,174 @@ class MCPToolProvider:
                 logger.error(f"Error in search_web: {e}")
                 logger.error(traceback.format_exc())
                 return f"Sorry, I couldn't search for '{query}' due to an error: {str(e)}"
+
+        @self.tool(
+            name="details_search_result", 
+            description="Retrieves and summarizes detailed content from a specific search result",
+            params=[
+                {
+                    "name": "result_number",
+                    "description": "The number of the search result to get details for",
+                    "required": True
+                }
+            ]
+        )
+        def details_search_result(result_number):
+            """Retrieves and summarizes detailed content from a specific search result"""
+            # Check if we have a valid result number
+            try:
+                if isinstance(result_number, str):
+                    # Extract the number if it's part of a string like "result 1"
+                    number_str = ""
+                    for char in result_number:
+                        if char.isdigit():
+                            number_str += char
+                    if number_str:
+                        result_index = int(number_str) - 1  # Convert to 0-based index
+                    else:
+                        return "Please provide a valid search result number (e.g., '1' or '2')"
+                else:
+                    result_index = int(result_number) - 1  # Convert to 0-based index
+            except (ValueError, TypeError):
+                return f"Invalid result number: {result_number}. Please provide a valid number like '1' or '2'."
+            
+            # Check if we have any cached search results
+            if not search_results_cache:
+                return "No search results available. Please perform a search first."
+            
+            # Get the most recent search results
+            latest_search_id = list(search_results_cache.keys())[-1]
+            search_data = search_results_cache[latest_search_id]
+            
+            # Check if the result index is valid
+            if result_index < 0 or result_index >= len(search_data["urls"]):
+                return f"Invalid result number. Please choose a number between 1 and {len(search_data['urls'])}."
+            
+            # Get the URL, title, and content for the result
+            url = search_data["urls"][result_index]
+            title = search_data["titles"][result_index]
+            content = search_data["contents"][result_index]
+            
+            # If we don't have content cached, try to fetch it
+            if not content:
+                # Try to fetch the content
+                try:
+                    logger.info(f"Fetching content for URL: {url}")
+                    response = requests.get(url, timeout=15, headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+                    })
+                    
+                    if response.status_code == 200:
+                        html_content = response.text
+                    else:
+                        return f"Failed to fetch content for '{title}' (status: {response.status_code})"
+                except Exception as e:
+                    logger.error(f"Error fetching URL content: {e}")
+                    return f"Error fetching content for '{title}': {str(e)}"
+                
+                # Parse and clean the HTML
+                try:
+                    soup = BeautifulSoup(html_content, 'html.parser')
+                    
+                    # Remove scripts, styles, and other non-content elements
+                    for element in soup(['script', 'style', 'meta', 'noscript', 'header', 'footer', 'nav', 'iframe', 'svg']):
+                        element.decompose()
+                    
+                    # Try to find main content
+                    main_content = None
+                    for tag in ['main', 'article', 'div[role="main"]', '.main-content', '#content', '.content', '.post-content']:
+                        main_element = soup.select_one(tag)
+                        if main_element:
+                            main_content = main_element.get_text(separator='\n', strip=True)
+                            break
+                    
+                    # If no main content found, use the body text
+                    if not main_content:
+                        main_content = soup.body.get_text(separator='\n', strip=True) if soup.body else soup.get_text(separator='\n', strip=True)
+                    
+                    # Clean up the content
+                    lines = [line.strip() for line in main_content.split('\n') if line.strip()]
+                    clean_content = '\n'.join(lines)
+                    
+                    # Truncate if too long
+                    if len(clean_content) > 6000:
+                        clean_content = clean_content[:6000] + "...(truncated)"
+                    
+                    # Update the cache with the cleaned content
+                    search_results_cache[latest_search_id]["contents"][result_index] = clean_content
+                    
+                    # Use the clean content for summarization
+                    content = clean_content
+                except Exception as e:
+                    logger.error(f"Error cleaning HTML: {e}")
+                    return f"Error processing content for '{title}': {str(e)}"
+            
+            # Get a summary from the LLM
+            try:
+                # Create a simple summary if the content is short enough
+                if len(content) < 1000:
+                    return f"Content from {title}:\n\n{content}\n\nURL: {url}"
+                
+                # Try to use the LLM for longer content
+                llm_provider = None
+                
+                try:
+                    # Import here to avoid circular imports
+                    from llm_provider import create_llm_provider, LLMProvider, OllamaProvider
+                    
+                    # First try to get a minimal config just for the LLM provider
+                    class MinimalConfig:
+                        def __init__(self):
+                            self.llm_provider = "ollama"
+                            self.ollama_base_url = "http://localhost:11434"
+                            self.ollama_model = "llama3"
+                            
+                    try:
+                        # Try to import the real config first
+                        import config as config_module
+                        if hasattr(config_module, 'Config'):
+                            config = config_module.Config()
+                        else:
+                            config = MinimalConfig()
+                    except ImportError:
+                        logger.warning("Could not import config module, using minimal config")
+                        config = MinimalConfig()
+                    
+                    # Create the LLM provider
+                    try:
+                        llm_provider = create_llm_provider(config)
+                        if not llm_provider.initialize():
+                            logger.warning("Failed to initialize LLM provider, falling back to content snippet")
+                            llm_provider = None
+                    except Exception as e:
+                        logger.error(f"Error initializing LLM provider: {e}")
+                        llm_provider = None
+                    
+                except Exception as e:
+                    logger.error(f"Error setting up LLM provider: {e}")
+                    llm_provider = None
+                
+                # If we couldn't get an LLM provider, just return the first part of the content
+                if not llm_provider:
+                    return f"Content from {title} (first 800 chars):\n\n{content[:800]}...\n\n(Content truncated, full content is {len(content)} characters)\n\nURL: {url}"
+                
+                # Create a prompt for summarization
+                summary_prompt = [
+                    {"role": "system", "content": "You are a helpful AI that provides extremely brief summaries of web content."},
+                    {"role": "user", "content": f"Provide an extremely concise summary of the following web content from '{title}'. Focus on the key information and keep your summary very brief (2-3 sentences at most):\n\n{content}"}
+                ]
+                
+                # Get the summary
+                summary = llm_provider.chat(summary_prompt)
+                
+                # Prepare the response
+                response = f"Summary of '{title}':\n\n{summary}\n\nURL: {url}"
+                return response
+                
+            except Exception as e:
+                logger.error(f"Error getting summary: {e}")
+                # Return a portion of the content if summarization fails
+                return f"Content from {title} (first 800 chars):\n\n{content[:800]}...\n\n(Content truncated, full content is {len(content)} characters)\n\nURL: {url}"
     
     def get_tool_descriptions(self):
         """Get a dictionary of tool names and descriptions"""
