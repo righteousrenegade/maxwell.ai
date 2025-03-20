@@ -134,6 +134,15 @@ class LLMProvider(ABC):
         """
         messages = self.format_user_query(query)
         return self.chat(messages, **kwargs)
+        
+    def cleanup(self):
+        """Clean up any resources used by the provider.
+        
+        This method should be called when the provider is no longer needed.
+        Subclasses should override this method if they need to perform cleanup operations.
+        """
+        logger.info(f"Cleaning up LLM provider: {self.__class__.__name__}")
+        pass
 
 
 class OllamaProvider(LLMProvider):
@@ -376,6 +385,13 @@ class OllamaProvider(LLMProvider):
             logger.error(f"Error in Ollama chat: {e}")
             logger.error(traceback.format_exc())
             raise Exception(f"Error communicating with Ollama: {str(e)}")
+
+    def cleanup(self):
+        """Clean up Ollama resources."""
+        logger.info(f"Cleaning up Ollama provider for model {self.model}")
+        # Nothing specific to clean up for Ollama currently
+        # But if there are any open connections or resources, they would be handled here
+        super().cleanup()
 
 
 class OpenAIProvider(LLMProvider):

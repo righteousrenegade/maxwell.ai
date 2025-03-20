@@ -36,9 +36,14 @@ __version__ = "1.0.0"
 try:
     from mcp_tools import MCPToolProvider
     HAS_MCP_TOOLS = True
-except ImportError:
+except ImportError as e:
     HAS_MCP_TOOLS = False
-    print("⚠️ MCP tools not available, skipping import")
+    print(f"⚠️ MCP tools import error: {str(e)}")
+    print("⚠️ This will disable search and other web-based features.")
+    import traceback
+    traceback.print_exc()
+    logger.error(f"Error importing MCP tools: {e}")
+    logger.error(traceback.format_exc())
 
 # Setup logger only once with a specific name to avoid duplicates
 logger = logging.getLogger("maxwell")
@@ -156,7 +161,6 @@ class StreamingAudioManager:
         self.last_volume = 0
         
         logger.info(f"StreamingAudioManager initialized with energy threshold: {energy_threshold}")
-        
     def _list_microphones(self):
         """List available microphones for debugging purposes"""
         try:
@@ -752,66 +756,56 @@ class StreamingAudioManager:
         return False
     
     def _is_likely_self_speech(self, text):
-        """Check if recognized text is likely to be the assistant's own speech"""
+        """Check if the recognized text is likely to be self-speech (the assistant hearing itself)"""
+        # Skip empty text
         if not text:
             return False
             
-        # Check against recent recognitions for exact or very similar matches
         text_lower = text.lower().strip()
         
-        # More careful checking of substring matches to avoid filtering user wake words
-        # Skip filtering for wake words like "hello maxwell"
-        wake_words = [self.wake_word] if self.wake_word else []
-        if any(wake_word in text_lower for wake_word in wake_words):
-            # Don't filter wake words when not in conversation
-            if not self.in_conversation:
-                logger.info(f"Wake word detected in '{text_lower}', not filtering")
-                return False
+        # Check for consecutive recognitions in a short time window
+        current_time = time.time()
+        time_since_last = current_time - self.last_recognition_time
         
-        # Check for exact matches which are very likely to be self-speech
-        for recent_text in self.recent_recognitions:
-            recent_lower = recent_text.lower().strip()
-            
-            # Exact match - definitely self-speech
-            if text_lower == recent_lower:
-                logger.info(f"Detected exact self-speech match: '{text_lower}'")
+        if time_since_last < self.feedback_detection_window:
+            self.consecutive_recognitions += 1
+            if self.consecutive_recognitions > self.max_consecutive_recognitions:
+                logger.info(f"Detected {self.consecutive_recognitions} consecutive recognitions in a short time frame - possible feedback loop")
+                self._reset_after_feedback_detection()
                 return True
+        else:
+            # Reset counter if enough time has passed
+            self.consecutive_recognitions = 1
+            
+        self.last_recognition_time = current_time
+        
+        # Don't filter out commands starting with "execute" or search queries
+        # as these are likely legitimate user commands
+        if text_lower.startswith('execute ') or text_lower.startswith('search '):
+            return False
+            
+        # Check for significant overlap with recent recognitions (the assistant's speech)
+        # but be less aggressive with the filtering
+        for recent_text in self.recent_recognitions:
+            if recent_text and len(recent_text) > 5:  # Only check substantial texts
+                # Calculate similarity score using character overlap
+                similarity = self._calculate_text_similarity(text_lower, recent_text.lower())
                 
-            # Substring match - only if significant overlap and not just wake word
-            if text_lower in recent_lower or recent_lower in text_lower:
-                # Only if the substring is significant AND not a simple wake word/greeting
-                # Calculate string similarity as a ratio of common chars using sets
-                text_set = set(text_lower)
-                recent_set = set(recent_lower)
-                common_chars = len(text_set.intersection(recent_set))
-                min_length = min(len(text_lower), len(recent_lower))
-                
-                # More conservative substring matching
-                if len(text_lower) > 10 and len(recent_lower) > 10 and common_chars > 7:
-                    logger.info(f"Detected significant self-speech overlap: '{text_lower}' vs '{recent_lower}'")
+                # If very high similarity (over 80%), it's likely self-speech
+                if similarity > 0.8:
+                    logger.info(f"Detected significant self-speech overlap: '{text_lower}' vs '{recent_text.lower()}'")
+                    logger.info(f"Filtered out likely self-speech: '{text}'")
                     return True
                     
-        # Check for common self-speech patterns when the assistant has recently spoken
-        if time.time() < self.speaking_end_time + 2.0:  # Within 2 seconds of speaking
-            # Common patterns that might indicate echo/self-speech
-            # Be more specific with patterns to avoid filtering legitimate commands
-            self_speech_patterns = [
-                "i'm sorry", "thank you", "you're welcome", 
-                "is there anything else"
-            ]
-            
-            for pattern in self_speech_patterns:
-                if pattern in text_lower:
-                    logger.info(f"Detected specific self-speech pattern: '{pattern}' in '{text_lower}'")
-                    return True
-            
-            # For very short phrases, check for common filler words only if they appear alone
-            if len(text_lower.split()) <= 2:
-                filler_words = ["okay", "alright", "yes", "hello", "bye", "sure"]
-                if text_lower in filler_words:
-                    logger.info(f"Detected short filler self-speech: '{text_lower}'")
-                    return True
-        
+        # Check for wake word / interrupt word repetition soon after speaking
+        if self.wake_word and self.wake_word in text_lower:
+            # If we just heard the wake word, and we immediately hear it again, it might be feedback
+            time_since_speaking = current_time - self.speaking_end_time
+            if time_since_speaking < 1.5:  # 1.5 seconds
+                logger.debug("Wake word detected very soon after speaking - possible self-speech")
+                return True
+                
+        # Not detected as self-speech
         return False
     
     def start(self, wake_word=None, interrupt_word=None):
@@ -980,140 +974,107 @@ class StreamingAudioManager:
             pass
     
     def _process_speech(self, text):
-        """Process recognized speech"""
-        if not text or self.should_stop:
+        """Process recognized speech and handle wake word and commands"""
+        if not text:
             return
         
-        current_time = time.time()
+        text = text.strip()
         
-        # Detect potential feedback loop
-        if current_time - self.last_recognition_time < self.feedback_detection_window:
-            self.consecutive_recognitions += 1
-            logger.info(f"Consecutive recognition #{self.consecutive_recognitions} within {self.feedback_detection_window}s window")
-            
-            # If we're getting too many recognitions in a short time, it's likely a feedback loop
-            if self.consecutive_recognitions >= self.max_consecutive_recognitions:
-                logger.warning(f"Feedback loop detected! {self.consecutive_recognitions} recognitions in {self.feedback_detection_window}s")
-                print("⚠️ Feedback loop detected! Ignoring input for a short time...")
-                
-                # Increase thresholds temporarily
-                temp_threshold = self.energy_threshold * 3.5
-                logger.info(f"Temporarily increasing threshold to {temp_threshold} to break feedback loop")
-                self.energy_threshold = temp_threshold
-                self.speaking_energy_threshold = temp_threshold * 1.2
-                
-                # Reset after a delay
-                threading.Timer(2.0, self._reset_after_feedback_detection).start()
-                return
-        else:
-            # Reset consecutive count if it's been a while
-            self.consecutive_recognitions = 1
+        # Add to recognition counters for debugging
+        self.recognition_count += 1
         
-        # Update last recognition time
-        self.last_recognition_time = current_time
-            
-        # Check if this is likely the assistant's own speech
+        # Log the recognized text
+        logger.info(f"Recognized: '{text}'")
+        print(f"✓ Recognized: \"{text}\"")
+        
+        # If we have an active audio source, make a note of this speech
+        self.last_audio_timestamp = time.time()
+
+        # Check for known problematic patterns and feedback
         if self._is_likely_self_speech(text):
-            logger.info(f"Ignoring likely self-speech: '{text}'")
-            return
+            return  # Skip processing this speech
             
-        text_lower = text.lower()
-        
         # Check for interrupt word
-        if self.interrupt_word and self.interrupt_word in text_lower:
-            logger.info(f"Interrupt word detected in: '{text}'")
-            print(f"🛑 Interrupt word detected!")
+        if self.interrupt_word and self.interrupt_word.lower() in text.lower():
+            # Call the speech_detected callback with interrupt event
             if self.on_speech_detected:
-                logger.info("Calling interrupt callback")
                 self.on_speech_detected("interrupt", text)
             return
-        
-        # Check for wake word if not in conversation
-        if not self.in_conversation:
-            wake_word_detected = self._check_wake_word(text)
+            
+        # Special handling for "execute" commands - prioritize these
+        if text.lower().startswith("execute "):
+            # If we're in conversation mode, process this as a command immediately
+            if self.in_conversation:
+                logger.info(f"Processing direct execute command in conversation mode: '{text}'")
+                if self.on_speech_recognized:
+                    self.on_speech_recognized(text)
+                return
                 
-            if wake_word_detected:
-                logger.info(f"Wake word detected in: '{text}'")
-                print(f"🔔 Wake word detected!")
-                self.in_conversation = True
-                if self.on_speech_detected:
-                    logger.info("Calling wake word callback")
-                    self.on_speech_detected("wake_word", text)
-                return
-            else:
-                logger.debug("Wake word not detected")
-                print("🔕 Wake word not detected, continuing to listen...")
-                return
-        
-        # Process regular speech if in conversation
-        logger.info(f"Processing speech in conversation mode: '{text}'")
-        
-        # Add to recent recognitions
-        self.recent_recognitions.append(text)
-        
-        if self.on_speech_recognized:
-            logger.info("Calling speech recognized callback")
-            self.on_speech_recognized(text)
-        else:
-            logger.warning("No speech recognized callback registered")
+        # If we're already in conversation mode, any speech is a command
+        if self.in_conversation:
+            logger.info(f"Processing speech in conversation mode: '{text}'")
+            # Call the speech_recognized callback
+            if self.on_speech_recognized:
+                logger.info("Calling speech recognized callback")
+                self.on_speech_recognized(text)
+            return
+
+        # Not in conversation mode yet - check for wake word
+        self._check_wake_word(text)
     
     def _check_wake_word(self, text):
-        """Check if the wake word is in the text"""
-        if not self.wake_word:
+        """Check if text contains the wake word and respond if found"""
+        # Skip if in conversation already
+        if self.in_conversation:
             return False
             
+        if not self.wake_word or not text:
+            return False
+        
+        # Convert to lowercase for case-insensitive matching
         text_lower = text.lower()
         wake_word_lower = self.wake_word.lower()
         
-        # Exact match
-        if wake_word_lower in text_lower:
-            logger.info(f"Wake word exact match: '{wake_word_lower}' in '{text_lower}'")
+        # Check for exact matches and variations
+        found = False
+        
+        # The actual wake word as a standalone or at the beginning
+        if (text_lower == wake_word_lower or 
+            text_lower.startswith(wake_word_lower + " ") or
+            " " + wake_word_lower + " " in text_lower or
+            text_lower.endswith(" " + wake_word_lower)):
+            found = True
+            
+        # Common variations with "hey", "hi", "hello"
+        variations = [
+            f"hey {wake_word_lower}",
+            f"hi {wake_word_lower}",
+            f"hello {wake_word_lower}",
+            f"ok {wake_word_lower}"
+        ]
+        
+        if not found:
+            for variation in variations:
+                if (text_lower == variation or
+                    text_lower.startswith(variation + " ") or
+                    " " + variation + " " in text_lower):
+                    found = True
+                    break
+                    
+        if found:
+            # Wake word detected - but DON'T set conversation mode here
+            # Let the speech_detected callback handle that
+            logger.info(f"Wake word detected in: '{text}'")
+            
+            # Call the callback without changing state here
+            if self.on_speech_detected:
+                logger.info("Calling wake word callback from _check_wake_word")
+                self.on_speech_detected("wake_word", text)
+                
             return True
-            
-        # Fuzzy matching for wake words
-        # Split wake word and input into individual words
-        wake_parts = wake_word_lower.split()
-        text_parts = text_lower.split()
-        
-        if len(wake_parts) > 1:
-            # For multi-word wake phrases like "hey maxwell" or "hello maxwell"
-            # Match if the name part is present or a close match
-            if len(wake_parts) >= 2 and len(text_parts) >= 1:
-                # The second part (name) is often the most important
-                name_part = wake_parts[-1]  # e.g. "maxwell" in "hey maxwell"
-                
-                # Check for exact name match
-                if name_part in text_parts:
-                    logger.info(f"Wake word name match: '{name_part}' in {text_parts}")
-                    return True
-                
-                # Check for partial match of name (e.g. "max" instead of "maxwell")
-                for part in text_parts:
-                    # If text contains first part of name (min 3 chars)
-                    if len(part) >= 3 and len(name_part) >= 3:
-                        if part[:3] == name_part[:3]:
-                            logger.info(f"Wake word partial match: '{part}' matches start of '{name_part}'")
-                            return True
-                            
-                        # Or if name contains first part of text (min 3 chars)
-                        if name_part[:3] == part[:3]:
-                            logger.info(f"Wake word partial match: '{name_part}' matches start of '{part}'")
-                            return True
-        
-        # For single word wake words, be more lenient
-        elif len(wake_parts) == 1:
-            wake_word = wake_parts[0]
-            
-            # Check for partial matches
-            for word in text_parts:
-                # Match if at least half the wake word matches
-                min_match_len = max(3, len(wake_word) // 2)
-                if len(wake_word) >= min_match_len and len(word) >= min_match_len:
-                    if wake_word[:min_match_len] == word[:min_match_len]:
-                        logger.info(f"Wake word partial match: '{word}' start matches '{wake_word}'")
-                        return True
-                        
-        return False
+        else:
+            logger.debug("Wake word not detected")
+            return False
 
     def get_debug_info(self):
         """Get debug information about the audio manager"""
@@ -1203,12 +1164,53 @@ class StreamingAudioManager:
         return None
 
     def _reset_after_feedback_detection(self):
-        """Reset thresholds after feedback detection"""
+        """Reset counters and adjust thresholds after feedback detection"""
         logger.info("Resetting thresholds after feedback detection")
-        self.energy_threshold = self.default_energy_threshold
-        self.speaking_energy_threshold = self.default_energy_threshold * 3.0
         self.consecutive_recognitions = 0
+        self.last_recognition_time = 0
+        # Increase energy threshold temporarily
+        self.energy_threshold += 100
+        logger.info(f"Temporarily increasing energy threshold to {self.energy_threshold} due to feedback detection")
         print("✅ Listening resumed with normal sensitivity")
+        
+    def _calculate_text_similarity(self, text1, text2):
+        """Calculate similarity between two text strings
+        
+        Returns a value between 0.0 (completely different) and 1.0 (identical)
+        """
+        # For very short texts, simple character comparison
+        if len(text1) < 3 or len(text2) < 3:
+            return 1.0 if text1 == text2 else 0.0
+            
+        # For longer texts, use character set overlap ratio
+        set1 = set(text1)
+        set2 = set(text2)
+        
+        # Calculate Jaccard similarity
+        intersection = len(set1.intersection(set2))
+        union = len(set1.union(set2))
+        set_similarity = intersection / union if union > 0 else 0
+        
+        # Calculate word overlap for better accuracy
+        words1 = set(text1.split())
+        words2 = set(text2.split())
+        
+        word_intersection = len(words1.intersection(words2))
+        word_union = len(words1.union(words2))
+        word_similarity = word_intersection / word_union if word_union > 0 else 0
+        
+        # Calculate substring similarity
+        substring_match = 0.0
+        if text1 in text2 or text2 in text1:
+            # Calculate how much of the shorter string is contained in the longer one
+            min_len = min(len(text1), len(text2))
+            max_len = max(len(text1), len(text2))
+            substring_match = min_len / max_len if max_len > 0 else 0.0
+            
+        # Weighted combination of similarity metrics
+        similarity = (0.3 * set_similarity) + (0.5 * word_similarity) + (0.2 * substring_match)
+        
+        return min(1.0, similarity)  # Cap at 1.0
 
 class StreamingMaxwell:
     def __init__(self, config):
@@ -1219,10 +1221,24 @@ class StreamingMaxwell:
         self.cleaned_up = False
         self.should_stop = False
         
+        # Debug the config object
+        logger.info(f"Config object type: {type(config)}")
+        logger.info(f"Config object dir: {dir(config)}")
+        logger.info(f"Config has use_mcp: {hasattr(config, 'use_mcp')}")
+        if hasattr(config, 'use_mcp'):
+            logger.info(f"Config use_mcp value: {config.use_mcp}")
+        logger.info(f"Config.get('use_mcp'): {config.get('use_mcp', 'NOT_FOUND')}")
+        
+        # Command mode flag - initially False
+        self.command_mode = False
+        
         # Initialize audio manager and mcp provider
         self.audio_manager = None
         self.mcp_tool_provider = None
-        self.tool_provider_started = False
+        
+        # Initialize LLM Provider directly
+        self.llm_provider = None
+        self._initialize_llm_provider()
         
         # Set wake and interrupt words
         self.wake_word = config.get('wake_word', 'maxwell').lower()
@@ -1256,35 +1272,63 @@ class StreamingMaxwell:
         logger.info("Initializing keyboard handler...")
         self.keyboard_handler = KeyboardHandler(self.tts)
         
-        # MCP Tool Provider setup
-        self.enable_mcp = config.get('use_mcp', True)
+        # MCP Tool Provider setup - simplified approach
+        self.enable_mcp = getattr(config, 'use_mcp', True)
+        logging.warning(f"MCP Tool Provider enabled: {self.enable_mcp}")
         if self.enable_mcp and HAS_MCP_TOOLS:
             logger.info("Initializing MCP Tool Provider...")
-            self.mcp_tool_provider = MCPToolProvider(self)
-            self.tool_provider_started = False
+            self.mcp_tool_provider = MCPToolProvider()
         else:
             if self.enable_mcp:
                 logger.warning("MCP tools requested but not available")
             self.mcp_tool_provider = None
         
         # Initialize Command Executor (will be set after initialization)
-        logger.info("Initializing Command Executor...")
-        self.command_executor = None
-        
+        logger.info("Initializing command executor...")
+        from commands import CommandExecutor
+        # logger.error(f"Self.mcp_tool_provider: {self.mcp_tool_provider}")
+        self.mcp_tool_provider = MCPToolProvider()
+        self.command_executor = CommandExecutor(mcp_tool_provider=self.mcp_tool_provider, config=self.config)
+        logger.info("Command executor initialized")
+    
         # Setup signal handlers
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
         
         logger.info(f"StreamingMaxwell initialized with wake word: '{self.wake_word}'")
+    
+    def _initialize_llm_provider(self):
+        """Initialize the LLM provider based on the configuration"""
+        from llm_provider import create_llm_provider
         
+        llm_provider_type = self.config.get('llm_provider', 'none').lower()
+        
+        try:
+            if llm_provider_type != 'none':
+                logger.info(f"Initializing LLM provider: {llm_provider_type}")
+                self.llm_provider = create_llm_provider(self.config)
+                logger.info(f"LLM provider initialized with model: {self.llm_provider.get_model_name()}")
+            else:
+                logger.info("No LLM provider configured")
+                self.llm_provider = None
+        except Exception as e:
+            logger.error(f"Error initializing LLM provider: {e}")
+            logger.error(traceback.format_exc())
+            print(f"⚠️ Warning: Failed to initialize LLM provider: {e}")
+            self.llm_provider = None
+    
     def _on_speech_detected(self, event_type, text):
         """Callback for speech detection events"""
         if event_type == "wake_word":
             logger.info(f"Wake word detected: {text}")
             self._play_listening_sound()
-            self.speak("Yes?")
+            
+            # Set conversation mode first, before speaking
             self.in_conversation = True
             self.audio_manager.set_conversation_mode(True)
+            
+            # Speak only once
+            self.speak("Yes?")
         elif event_type == "interrupt":
             logger.info(f"Interrupt word detected: {text}")
             self.tts.stop()
@@ -1361,6 +1405,12 @@ class StreamingMaxwell:
             if hasattr(self, 'mcp_tool_provider') and self.mcp_tool_provider:
                 logger.info("Stopping MCP Tool Provider...")
                 self.mcp_tool_provider.stop_server()
+                
+            # Clean up LLM provider if it has a cleanup method
+            if hasattr(self, 'llm_provider') and self.llm_provider:
+                logger.info("Cleaning up LLM provider...")
+                if hasattr(self.llm_provider, 'cleanup'):
+                    self.llm_provider.cleanup()
                 
             # Mark as cleaned up
             self.cleaned_up = True
@@ -1446,53 +1496,50 @@ class StreamingMaxwell:
     def handle_query(self, query):
         """Handle a user query using MCP tools when possible"""
         if not query:
-            logger.info("Empty query, ignoring")
             return
             
-        logger.info(f"Handling query: {query}")
+        # Log the query
+        query_lower = query.lower().strip()
+        logger.info(f"Handling query: '{query}'")
         
-        # Check for "end conversation" command
-        if "end conversation" in query.lower():
-            logger.info("End conversation command detected")
-            self.speak("Ending conversation.")
-            self.in_conversation = False
-            self.audio_manager.set_conversation_mode(False)
-            print("🔴 Conversation ended. Say the wake word to start again.")
-            return
-        
-        # Special handling for "execute" commands
-        query_lower = query.lower()
+        # Command mode check
+        if self.command_mode:
+            if not query_lower.startswith("execute "):
+                logger.info(f"Command mode - adding execute prefix to: '{query}'")
+                query = f"execute {query}"
+                query_lower = query.lower()  # Update the lowercase version
+                
+        # If we have a command executor, try to use it first
         if query_lower.startswith("execute "):
-            # Extract the command part
+            # Extract the actual command part
             command_text = query[8:].strip()
             logger.info(f"Execute command detected: '{command_text}'")
             
-            # Check for "execute search" pattern
-            if command_text.lower().startswith("search "):
+            # Directly use execute_command for better handling
+            if self.command_executor:
+                logger.info(f"Using direct command execution for: '{command_text}'")
+                print(f"⚡ Executing command: '{command_text}'")
+                response = self.command_executor.execute_command(command_text)
+                if response:
+                    self.speak(response)
+                return
+                
+            # Special case for "execute search" pattern if command executor is not available
+            if command_text.lower().startswith("search ") and self.enable_mcp and self.mcp_tool_provider:
                 search_term = command_text[7:].strip()
                 logger.info(f"Execute search command detected: '{search_term}'")
-                
-                # Use MCP tools for search if available
-                if self.enable_mcp and self.mcp_tool_provider:
-                    logger.info(f"Using MCP search_web tool for: '{search_term}'")
-                    print(f"🔍 Searching for: '{search_term}'")
-                    response = self.mcp_tool_provider.execute_tool("search_web", query=search_term)
-                    if response:
-                        self.speak(response)
-                    return
+                print(f"🔍 Searching for: '{search_term}'")
+                response = self.mcp_tool_provider.execute_tool("search_web", query=search_term)
+                if response:
+                    self.speak(response)
+                return
         
         # MCP tools integration - check if tools are available
         if self.enable_mcp and self.mcp_tool_provider:
             # Start the tool provider if not already started
-            if not self.tool_provider_started:
-                logger.info("Starting MCP tool provider...")
-                self.mcp_tool_provider.start_server()
-                self.tool_provider_started = True
-                
-                # Register MCP tools with command executor
-                if self.command_executor:
-                    logger.info("Registering MCP tools with command executor")
-                    self.command_executor._register_mcp_tools()
+            if self.command_executor:
+                logger.info("Registering MCP tools with command executor")
+                self.command_executor._register_mcp_tools()
                 
             # Get available tools
             available_tools = self.mcp_tool_provider.get_tool_descriptions()
@@ -1528,15 +1575,28 @@ class StreamingMaxwell:
                         self.speak(response)
                     return
             
-            # Handle search commands - improved detection
-            search_keywords = ["search", "search for", "look up", "find", "find information about"]
+            # Handle search commands directly - prioritize these for better user experience
+            if query_lower.startswith("search "):
+                search_term = query[7:].strip()
+                logger.info(f"Search command detected - search term: '{search_term}'")
+                print(f"🔍 Processing search for: '{search_term}'")
+                response = self.mcp_tool_provider.execute_tool("search_web", query=search_term)
+                if response:
+                    self.speak(response)
+                return
+            
+            # Handle other search patterns
+            search_keywords = ["search for", "look up", "find", "find information about"]
             is_search_command = False
             search_term = ""
             
             for keyword in search_keywords:
-                if query_lower.startswith(keyword + " "):
+                if query_lower.startswith(keyword + " ") or keyword + " " in query_lower:
                     is_search_command = True
-                    search_term = query_lower.replace(keyword, "", 1).strip()
+                    if keyword + " " in query_lower:
+                        search_term = query_lower.split(keyword + " ", 1)[1].strip()
+                    else:
+                        search_term = query_lower.replace(keyword, "", 1).strip()
                     break
             
             if is_search_command and search_term:
@@ -1546,80 +1606,107 @@ class StreamingMaxwell:
                 if response:
                     self.speak(response)
                 return
-                
-            # Weather with location
-            weather_patterns = ["weather in ", "weather for ", "what's the weather in ", "what is the weather in "]
-            for pattern in weather_patterns:
-                if pattern in query_lower:
-                    location = query_lower.split(pattern, 1)[1].strip()
-                    logger.info(f"Weather command detected with location: {location}")
-                    print(f"🌤️ Getting weather for {location}...")
-                    response = self.mcp_tool_provider.execute_tool("get_weather", location=location)
-                    if response:
-                        self.speak(response)
-                    return
+        
+        # Weather with location
+        weather_patterns = ["weather in ", "weather for ", "what's the weather in ", "what is the weather in "]
+        for pattern in weather_patterns:
+            if pattern in query_lower:
+                location = query_lower.split(pattern, 1)[1].strip()
+                logger.info(f"Weather command detected with location: {location}")
+                print(f"🌤️ Getting weather for {location}...")
+                response = self.mcp_tool_provider.execute_tool("get_weather", location=location)
+                if response:
+                    self.speak(response)
+                return
+        
+        # Set reminder
+        if "remind me" in query_lower or "set a reminder" in query_lower:
+            logger.info("Reminder command detected")
+            reminder_text = query_lower.replace("remind me", "").replace("set a reminder", "").replace("to", "", 1).strip()
+            response = self.mcp_tool_provider.execute_tool("set_reminder", text=reminder_text)
+            if response:
+                self.speak(response)
+            return
             
-            # Set reminder
-            if "remind me" in query_lower or "set a reminder" in query_lower:
-                logger.info("Reminder command detected")
-                reminder_text = query_lower.replace("remind me", "").replace("set a reminder", "").replace("to", "", 1).strip()
-                response = self.mcp_tool_provider.execute_tool("set_reminder", text=reminder_text)
+        # Set timer
+        timer_patterns = ["set a timer for ", "timer for ", "set timer for "]
+        for pattern in timer_patterns:
+            if pattern in query_lower:
+                duration = query_lower.split(pattern, 1)[1].strip()
+                logger.info(f"Timer command detected: {duration}")
+                response = self.mcp_tool_provider.execute_tool("set_timer", duration=duration)
                 if response:
                     self.speak(response)
                 return
-                
-            # Set timer
-            timer_patterns = ["set a timer for ", "timer for ", "set timer for "]
-            for pattern in timer_patterns:
-                if pattern in query_lower:
-                    duration = query_lower.split(pattern, 1)[1].strip()
-                    logger.info(f"Timer command detected: {duration}")
-                    response = self.mcp_tool_provider.execute_tool("set_timer", duration=duration)
-                    if response:
-                        self.speak(response)
-                    return
+        
+        # Play music
+        if "play music" in query_lower or "play some music" in query_lower:
+            logger.info("Play music command detected")
+            response = self.mcp_tool_provider.execute_tool("play_music")
+            if response:
+                self.speak(response)
+            return
             
-            # Play music
-            if "play music" in query_lower or "play some music" in query_lower:
-                logger.info("Play music command detected")
-                response = self.mcp_tool_provider.execute_tool("play_music")
-                if response:
-                    self.speak(response)
-                return
-                
-            # Play specific song or artist
-            if "play " in query_lower:
-                # Extract what to play
-                play_request = query_lower.replace("play ", "", 1).strip()
-                logger.info(f"Play specific music: {play_request}")
-                
-                # Check if it's a song by an artist
-                if " by " in play_request:
-                    song, artist = play_request.split(" by ", 1)
-                    response = self.mcp_tool_provider.execute_tool("play_music", song=song, artist=artist)
-                else:
-                    # Could be a song name or artist name
-                    response = self.mcp_tool_provider.execute_tool("play_music", song=play_request)
-                
-                if response:
-                    self.speak(response)
-                return
-                
-        # If we get here and have a command executor, fall back to it
-        if hasattr(self, 'command_executor') and self.command_executor:
-            # Use the LLM/command executor as fallback
+        # Play specific song or artist
+        if "play " in query_lower:
+            # Extract what to play
+            play_request = query_lower.replace("play ", "", 1).strip()
+            logger.info(f"Play specific music: {play_request}")
+            
+            # Check if it's a song by an artist
+            if " by " in play_request:
+                song, artist = play_request.split(" by ", 1)
+                response = self.mcp_tool_provider.execute_tool("play_music", song=song, artist=artist)
+            else:
+                # Could be a song name or artist name
+                response = self.mcp_tool_provider.execute_tool("play_music", song=play_request)
+            
+            if response:
+                self.speak(response)
+            return
+    
+        # If we get here and have a command executor, use it
+        if self.command_executor:
             try:
-                logger.info("No direct MCP tool match - using command executor")
-                print("💭 Processing with command executor...")
+                logger.info("Using command executor for query")
                 response = self.command_executor.execute(query)
                 if response:
                     self.speak(response)
+                    return
             except Exception as e:
-                logger.error(f"Error handling query with command executor: {e}")
-                self.speak("I'm sorry, I encountered an error processing your request.")
+                logger.error(f"Error executing command: {e}")
+                logger.error(traceback.format_exc())
+                
+        # If command executor didn't handle it, try direct LLM provider
+        if hasattr(self, 'llm_provider') and self.llm_provider:
+            try:
+                # Check if LLM provider is available
+                if self.llm_provider.check_connection():
+                    logger.info(f"Querying LLM provider directly: {query}")
+                    print("💭 Thinking...")
+                    
+                    # Format the query into messages
+                    messages = self.llm_provider.format_user_query(query)
+                    
+                    # Send to LLM provider and get response
+                    response = self.llm_provider.chat(messages)
+                    
+                    if response:
+                        logger.info("Got response from LLM provider")
+                        self.speak(response)
+                        return
+                    else:
+                        logger.warning("Empty response from LLM provider")
+                else:
+                    logger.warning("LLM provider is not available")
+            except Exception as e:
+                logger.error(f"Error querying LLM provider: {e}")
+                logger.error(traceback.format_exc())
+                self.speak(f"I'm sorry, I encountered an error processing your request: {str(e)}")
+                return
         else:
-            # No command executor available
-            logger.error("No command executor or MCP tools available to handle the query")
+            # No command executor or LLM provider available
+            logger.error("No command executor or LLM provider available to handle the query")
             self.speak("I'm sorry, I'm not able to process that request right now.")
     
     def run(self):
@@ -1632,18 +1719,10 @@ class StreamingMaxwell:
             self.keyboard_handler.start(self.tts)
             logger.info("Keyboard handler started - SPACE key will interrupt speech")
             
-            # Initialize the command executor if not already done
-            if not self.command_executor:
-                logger.info("Initializing command executor...")
-                from commands import CommandExecutor
-                self.command_executor = CommandExecutor(self, self.config)
-                logger.info("Command executor initialized")
             
             # Start MCP tool provider if enabled
             if self.enable_mcp and self.mcp_tool_provider:
                 logger.info("Starting MCP tool provider...")
-                self.mcp_tool_provider.start_server()
-                self.tool_provider_started = True
                 print(f"🔧 MCP tools integration enabled")
                 
                 # Log available tools
@@ -1656,25 +1735,23 @@ class StreamingMaxwell:
                     logger.info("Registering MCP tools with command executor")
                     self.command_executor._register_mcp_tools()
             
-            # Initialize the LLM provider based on configuration
-            llm_provider = getattr(self.config, 'llm_provider', 'none').lower()
-            
-            # Print LLM provider information
-            if llm_provider == 'openai':
-                print(f"🧠 Using OpenAI API ({self.config.get('openai_model', 'unknown model')})")
-                logger.info(f"Using OpenAI API with model {self.config.get('openai_model', 'unknown')}")
-                print(f"   API URL: {self.config.get('openai_base_url', 'unknown')}")
-            elif llm_provider == 'ollama':
-                model = getattr(self.config, 'model', 'unknown')
-                base_url = getattr(self.config, 'ollama_base_url', 'unknown')
-                print(f"🧠 Using Ollama ({model})")
-                logger.info(f"Using Ollama with model {model} at {base_url}")
-            elif llm_provider == 'none':
-                print("🧠 No LLM provider configured")
-                logger.info("No LLM provider configured")
+            # Print LLM provider information if available
+            llm_provider_type = self.config.get('llm_provider', 'none').lower()
+            if hasattr(self, 'llm_provider') and self.llm_provider:
+                # Print LLM provider information based on the actual provider instance
+                model_name = self.llm_provider.get_model_name()
+                if llm_provider_type == 'openai':
+                    base_url = getattr(self.config, 'openai_base_url', 'unknown')
+                    print(f"🧠 Using OpenAI API ({model_name})")
+                    print(f"   API URL: {base_url}")
+                elif llm_provider_type == 'ollama':
+                    base_url = getattr(self.config, 'ollama_base_url', 'unknown')
+                    print(f"🧠 Using Ollama ({model_name})")
+                    logger.info(f"Using Ollama with model {model_name} at {base_url}")
+                else:
+                    print(f"🧠 Using {llm_provider_type} provider ({model_name})")
             else:
-                print(f"🧠 Using {llm_provider} provider")
-                logger.info(f"Using provider: {llm_provider}")
+                print("🧠 No LLM provider configured, running in command-only mode")
             
             # Ensure the wake word is set
             if not self.wake_word and hasattr(self.config, 'wake_word'):

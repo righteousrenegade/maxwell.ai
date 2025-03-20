@@ -12,6 +12,7 @@ general:
   energy_threshold: 300  # Lower = more sensitive microphone
   save_audio: false      # Save audio files for debugging
   debug: false           # Enable debug logging
+  use_mcp: true          # Enable MCP tools for web search and other features
 
 # LLM Provider Configuration
 llm:

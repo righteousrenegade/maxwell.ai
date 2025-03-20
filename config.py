@@ -32,6 +32,7 @@ CONFIG_DEFAULTS = {
     "voice": "bm_lewis",
     "speed": 1.15,
     "listen_timeout": 7,
+    "use_mcp": True,
     
     # LLM provider settings
     "llm_provider": "ollama",  # "ollama" or "openai"

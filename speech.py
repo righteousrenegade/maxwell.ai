@@ -24,7 +24,12 @@ class DummyTTS:
             print(f"🔇 {text}")
     
     def stop(self):
-        pass
+        """Stop dummy speech (does nothing)"""
+        try:
+            logger.debug("DummyTTS stop called (no-op)")
+        except Exception as e:
+            # Catch-all to ensure this never crashes
+            pass
         
     def is_speaking(self):
         return False
@@ -204,36 +209,46 @@ class TextToSpeech:
             
     def stop(self):
         """Stop current speech"""
-        # Use a lock to prevent multiple stop calls from interfering with each other
-        with self._speaking_lock:
-            # Only take action if we're actually speaking
-            if self._is_speaking:
-                logger.info("Stopping TTS playback...")
-                try:
-                    # Stop sounddevice playback
-                    sd.stop()
-                    logger.info("TTS playback stopped")
-                    
-                    # Update speaking state - must be done while holding lock
-                    self._is_speaking = False
-                    
-                    # Add small delay to ensure cleanup is complete
-                    time.sleep(0.1)
-                    
-                except Exception as e:
-                    logger.error(f"Error stopping TTS playback: {e}")
-                    # Still mark as not speaking even if error occurs
-                    self._is_speaking = False
-                
-                # Call the speaking stopped callback if it exists - still inside lock to prevent race conditions
-                if self.on_speaking_stopped:
+        try:
+            # Use a lock to prevent multiple stop calls from interfering with each other
+            with self._speaking_lock:
+                # Only take action if we're actually speaking
+                if self._is_speaking:
+                    logger.info("Stopping TTS playback...")
                     try:
-                        self.on_speaking_stopped()
+                        # Stop sounddevice playback
+                        sd.stop()
+                        logger.info("TTS playback stopped")
                     except Exception as e:
-                        logger.error(f"Error in on_speaking_stopped callback: {e}")
-            else:
-                # Log but don't take action if we're not speaking
-                logger.debug("Stop called but not currently speaking - ignoring")
+                        logger.error(f"Error stopping sounddevice playback: {e}")
+                        # Don't re-raise - we want to continue with cleanup
+                    finally:
+                        # Always update speaking state
+                        self._is_speaking = False
+                        
+                        # Add small delay to ensure cleanup is complete
+                        try:
+                            time.sleep(0.1)
+                        except:
+                            pass
+                    
+                    # Call the speaking stopped callback if it exists - still inside lock to prevent race conditions
+                    if self.on_speaking_stopped:
+                        try:
+                            self.on_speaking_stopped()
+                        except Exception as e:
+                            logger.error(f"Error in on_speaking_stopped callback: {e}")
+                else:
+                    # Log but don't take action if we're not speaking
+                    logger.debug("Stop called but not currently speaking - ignoring")
+        except Exception as outer_e:
+            # Catch-all to prevent any possible crash
+            logger.error(f"Unexpected error in TTS.stop method: {outer_e}")
+            try:
+                # Last resort attempt to stop the audio
+                sd.stop()
+            except:
+                pass
             
     def is_speaking(self):
         """Check if currently speaking"""
