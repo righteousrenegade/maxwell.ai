@@ -164,6 +164,7 @@ class CommandExecutor:
                     kwargs["song"] = args
                     
             # Execute the tool through the mcp_tool_provider directly
+            logger.info(f"Preceding the execution of MCP tool: {tool_name} with kwargs: {kwargs}")
             result = self.mcp_tool_provider.execute_tool(tool_name, **kwargs)
             logger.info(f"Tool execution result: {result}")
             return result
@@ -295,7 +296,7 @@ class CommandExecutor:
         # Try executing through MCP tools if available
         for tool_name in self.mcp_tools:
             if command == tool_name or command.replace("_", " ") == tool_name.replace("_", " "):
-                logger.info(f"Executing MCP tool: {tool_name} with args: {args}")
+                logger.info(f"Executing MCP tool via self._execute_mcp_tool: {tool_name} with args: {args}")
                 return self._execute_mcp_tool(tool_name, args)
         
         # Special handling for common commands even if they don't match an exact MCP tool name

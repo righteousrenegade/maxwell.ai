@@ -31,6 +31,9 @@ class KeyboardHandler:
         self.last_keypress_time = 0
         self.debounce_interval = 1.0  # 1 second debounce interval
         
+        # Custom callback for space key (if provided)
+        self.space_key_callback = None
+        
         # Import platform-specific modules
         if self.platform == "Windows":
             try:
@@ -84,82 +87,189 @@ class KeyboardHandler:
     
     def _keyboard_thread(self):
         """Main keyboard handling thread function."""
-        logger.info("Keyboard handler thread running")
+        try:
+            logger.info("Keyboard handler thread running")
+            
+            if self.platform == "Windows" and self.msvcrt:
+                self._handle_windows_keyboard()
+            elif self.termios:
+                self._handle_unix_keyboard()
+            else:
+                logger.error("No keyboard handler available for this platform")
+                self.running = False
+        except Exception as e:
+            logger.error(f"Critical error in keyboard handler thread: {e}")
+            logger.error("Keyboard handler thread stopping but keeping program running")
+            # Don't re-raise to avoid terminating the main program
+    
+    def set_space_key_callback(self, callback):
+        """Set a custom callback to be called when space key is pressed.
         
-        if self.platform == "Windows" and self.msvcrt:
-            self._handle_windows_keyboard()
-        elif self.termios:
-            self._handle_unix_keyboard()
-        else:
-            logger.error("No keyboard handler available for this platform")
-            self.running = False
+        Args:
+            callback: A function to call when space key is pressed.
+                     If provided, this will be called instead of directly stopping TTS.
+        """
+        logger.info("=== SPACE KEY DEBUG: Setting custom space key callback ===")
+        self.space_key_callback = callback
+        logger.info("=== SPACE KEY DEBUG: Custom space key callback set ===")
     
     def _handle_windows_keyboard(self):
         """Handle keyboard input on Windows."""
-        while self.running:
-            # Check if a key has been pressed
-            if self.msvcrt.kbhit():
-                key = self.msvcrt.getch()
-                # Space key (32 in ASCII)
-                if key == b' ':
-                    current_time = time.time()
-                    # Check if enough time has passed since the last keypress
-                    if current_time - self.last_keypress_time > self.debounce_interval:
-                        logger.info("Space key pressed - interrupting speech")
-                        if self.tts and hasattr(self.tts, 'stop'):
-                            self.tts.stop()
-                        self.last_keypress_time = current_time
-                        
-                        # Flush any pending input to avoid phantom key presses
-                        self._flush_input_buffer()
-                    else:
-                        logger.info(f"Ignoring potential phantom space keypress (within debounce interval)")
+        try:
+            while self.running:
+                try:
+                    # Check if a key has been pressed
+                    if self.msvcrt.kbhit():
+                        try:
+                            key = self.msvcrt.getch()
+                            # Space key (32 in ASCII)
+                            if key == b' ':
+                                current_time = time.time()
+                                # Check if enough time has passed since the last keypress
+                                if current_time - self.last_keypress_time > self.debounce_interval:
+                                    logger.info("Space key pressed - interrupting speech")
+                                    
+                                    # Use custom callback if provided
+                                    if self.space_key_callback:
+                                        logger.info("=== SPACE KEY DEBUG: Using custom space key callback ===")
+                                        try:
+                                            self.space_key_callback()
+                                            logger.info("=== SPACE KEY DEBUG: Custom callback completed successfully ===")
+                                        except Exception as callback_error:
+                                            logger.error(f"=== SPACE KEY DEBUG: Error in custom callback: {callback_error} ===")
+                                            # Fall back to standard approach if callback fails
+                                            self._safe_stop_tts()
+                                    else:
+                                        # Use standard approach
+                                        try:
+                                            if self.tts and hasattr(self.tts, 'stop'):
+                                                # Call stop in a protected way
+                                                self._safe_stop_tts()
+                                        except Exception as e:
+                                            logger.error(f"Error stopping TTS: {e}")
+                                            # Continue despite the error
+                                            
+                                    self.last_keypress_time = current_time
+                                    
+                                    # Flush any pending input to avoid phantom key presses
+                                    self._flush_input_buffer()
+                                else:
+                                    logger.info(f"Ignoring potential phantom space keypress (within debounce interval)")
+                        except Exception as key_error:
+                            logger.error(f"Error handling key press: {key_error}")
+                            # Continue running even if an error occurs while handling key
                     
-            # Sleep to avoid high CPU usage
-            time.sleep(0.1)
+                    # Sleep to avoid high CPU usage
+                    time.sleep(0.1)
+                except KeyboardInterrupt:
+                    logger.warning("KeyboardInterrupt in keyboard handler - ignoring")
+                    # Don't let KeyboardInterrupt propagate
+                    continue
+                except Exception as loop_error:
+                    logger.error(f"Error in keyboard handler loop: {loop_error}")
+                    # Don't terminate the loop for any error
+                    time.sleep(0.5)  # Sleep a bit longer after an error
+        except Exception as outer_error:
+            logger.error(f"Fatal error in Windows keyboard handler: {outer_error}")
+            # Don't propagate errors from the keyboard handler
+            # Just log and continue - don't terminate the application
+            self.running = False
     
     def _handle_unix_keyboard(self):
         """Handle keyboard input on Unix-based systems."""
         # Save the terminal settings
         fd = self.sys.stdin.fileno()
-        old_settings = self.termios.tcgetattr(fd)
+        old_settings = None
+        try:
+            old_settings = self.termios.tcgetattr(fd)
+        except Exception as term_error:
+            logger.error(f"Error getting terminal settings: {term_error}")
+            # Continue even with error
         
         try:
-            # Configure terminal for non-blocking input
-            new_settings = self.termios.tcgetattr(fd)
-            new_settings[3] = new_settings[3] & ~self.termios.ICANON
-            new_settings[3] = new_settings[3] & ~self.termios.ECHO
-            self.termios.tcsetattr(fd, self.termios.TCSANOW, new_settings)
-            
-            while self.running:
-                # Poll for keyboard input
-                ready, _, _ = self.select.select([self.sys.stdin], [], [], 0.1)
+            # Only modify terminal if we got valid settings
+            if old_settings:
+                try:
+                    # Configure terminal for non-blocking input
+                    new_settings = self.termios.tcgetattr(fd)
+                    new_settings[3] = new_settings[3] & ~self.termios.ICANON
+                    new_settings[3] = new_settings[3] & ~self.termios.ECHO
+                    self.termios.tcsetattr(fd, self.termios.TCSANOW, new_settings)
+                except Exception as setup_error:
+                    logger.error(f"Error configuring terminal: {setup_error}")
                 
-                if ready:
-                    key = self.sys.stdin.read(1)
-                    # Space key
-                    if key == ' ':
-                        current_time = time.time()
-                        # Check if enough time has passed since the last keypress
-                        if current_time - self.last_keypress_time > self.debounce_interval:
-                            logger.info("Space key pressed - interrupting speech")
-                            if self.tts and hasattr(self.tts, 'stop'):
-                                self.tts.stop()
-                            self.last_keypress_time = current_time
-                            
-                            # Flush any pending input to avoid phantom key presses
-                            self._flush_input_buffer()
-                        else:
-                            logger.info(f"Ignoring potential phantom space keypress (within debounce interval)")
-                
-                # Sleep to avoid high CPU usage
-                time.sleep(0.1)
+            try:
+                while self.running:
+                    try:
+                        # Poll for keyboard input
+                        ready, _, _ = self.select.select([self.sys.stdin], [], [], 0.1)
+                        
+                        if ready:
+                            key = self.sys.stdin.read(1)
+                            # Space key
+                            if key == ' ':
+                                current_time = time.time()
+                                # Check if enough time has passed since the last keypress
+                                if current_time - self.last_keypress_time > self.debounce_interval:
+                                    logger.info("Space key pressed - interrupting speech")
+                                    
+                                    # Use custom callback if provided
+                                    if self.space_key_callback:
+                                        logger.info("=== SPACE KEY DEBUG: Using custom space key callback ===")
+                                        try:
+                                            self.space_key_callback()
+                                            logger.info("=== SPACE KEY DEBUG: Custom callback completed successfully ===")
+                                        except Exception as callback_error:
+                                            logger.error(f"=== SPACE KEY DEBUG: Error in custom callback: {callback_error} ===")
+                                            # Fall back to standard approach if callback fails
+                                            self._safe_stop_tts()
+                                    else:
+                                        # Use standard approach
+                                        try:
+                                            if self.tts and hasattr(self.tts, 'stop'):
+                                                # Call stop in a protected way
+                                                self._safe_stop_tts()
+                                        except Exception as e:
+                                            logger.error(f"Error stopping TTS: {e}")
+                                            # Continue despite the error
+                                            
+                                    self.last_keypress_time = current_time
+                                    
+                                    # Flush any pending input to avoid phantom key presses
+                                    self._flush_input_buffer()
+                                else:
+                                    logger.info(f"Ignoring potential phantom space keypress (within debounce interval)")
+                    except KeyboardInterrupt:
+                        logger.warning("KeyboardInterrupt in Unix keyboard handler - ignoring")
+                        # Don't let KeyboardInterrupt propagate
+                        continue
+                    except Exception as key_error:
+                        logger.error(f"Error handling keyboard input: {key_error}")
+                        # Continue running even if an error occurs handling input
+                    
+                    # Sleep to avoid high CPU usage
+                    try:
+                        time.sleep(0.1)
+                    except Exception:
+                        # Handle potential interrupt during sleep
+                        pass
+            except Exception as loop_error:
+                logger.error(f"Error in Unix keyboard handler loop: {loop_error}")
+                # Don't terminate the thread on loop error
+                time.sleep(1)
                 
         except Exception as e:
             logger.error(f"Error in Unix keyboard handler: {e}")
+            # No re-raising to avoid terminating the program
         finally:
             # Restore terminal settings
-            self.termios.tcsetattr(fd, self.termios.TCSANOW, old_settings)
+            if old_settings:
+                try:
+                    self.termios.tcsetattr(fd, self.termios.TCSANOW, old_settings)
+                    logger.debug("Unix terminal settings restored")
+                except Exception as term_error:
+                    logger.error(f"Error restoring terminal settings: {term_error}")
+                    # Continue even after failure to restore settings
     
     def _flush_input_buffer(self):
         """Flush any pending input in the buffer to prevent phantom keypresses."""
@@ -175,3 +285,55 @@ class KeyboardHandler:
         except Exception as e:
             logger.error(f"Error flushing input buffer: {e}")
             # Continue even if flushing fails 
+    
+    def _safe_stop_tts(self):
+        """Safely stop TTS with extra protection against exceptions"""
+        try:
+            logger.info("=== SPACE KEY DEBUG: _safe_stop_tts STARTED ===")
+            # Add extra checks
+            if self.tts is None:
+                logger.warning("TTS is None in _safe_stop_tts - nothing to stop")
+                logger.info("=== SPACE KEY DEBUG: _safe_stop_tts ENDED (tts is None) ===")
+                return
+            
+            logger.info("=== SPACE KEY DEBUG: TTS object exists ===")
+            
+            if not hasattr(self.tts, 'stop'):
+                logger.warning("TTS has no stop method - cannot stop")
+                logger.info("=== SPACE KEY DEBUG: _safe_stop_tts ENDED (no stop method) ===")
+                return
+            
+            logger.info("=== SPACE KEY DEBUG: TTS has stop method ===")
+            
+            # Try to get _speaking_lock status if it exists
+            if hasattr(self.tts, '_speaking_lock'):
+                try:
+                    logger.info(f"=== SPACE KEY DEBUG: TTS speaking lock exists, is_speaking: {self.tts.is_speaking()} ===")
+                except Exception as e:
+                    logger.error(f"=== SPACE KEY DEBUG: Error checking is_speaking: {e} ===")
+            
+            # Call in a protected way
+            logger.info("=== SPACE KEY DEBUG: About to call tts.stop() ===")
+            self.tts.stop()
+            logger.info("=== SPACE KEY DEBUG: tts.stop() completed successfully ===")
+            
+            # Add a delay to ensure the call completes
+            try:
+                time.sleep(0.1)
+                logger.info("=== SPACE KEY DEBUG: Post-stop delay completed ===")
+            except Exception as sleep_e:
+                logger.error(f"=== SPACE KEY DEBUG: Error in post-stop delay: {sleep_e} ===")
+            
+            # Check the speaking state after stopping
+            try:
+                if hasattr(self.tts, 'is_speaking'):
+                    is_still_speaking = self.tts.is_speaking()
+                    logger.info(f"=== SPACE KEY DEBUG: After stop, is_speaking: {is_still_speaking} ===")
+            except Exception as check_e:
+                logger.error(f"=== SPACE KEY DEBUG: Error checking speaking state after stop: {check_e} ===")
+            
+            logger.info("=== SPACE KEY DEBUG: _safe_stop_tts COMPLETED SUCCESSFULLY ===")
+        except Exception as e:
+            logger.error(f"=== SPACE KEY DEBUG: ERROR in _safe_stop_tts: {e} ===")
+            logger.error(f"=== SPACE KEY DEBUG: Error traceback: {e.__class__.__name__} ===")
+            # Swallow exception completely 

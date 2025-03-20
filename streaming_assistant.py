@@ -1274,6 +1274,7 @@ class StreamingMaxwell:
         
         # MCP Tool Provider setup - simplified approach
         self.enable_mcp = getattr(config, 'use_mcp', True)
+        print("config was\n============================\n", config, "\n============================\n")
         logging.warning(f"MCP Tool Provider enabled: {self.enable_mcp}")
         if self.enable_mcp and HAS_MCP_TOOLS:
             logger.info("Initializing MCP Tool Provider...")
@@ -1362,20 +1363,73 @@ class StreamingMaxwell:
     
     def _on_speaking_stopped(self):
         """Callback for when the assistant stops speaking"""
-        logger.info("Assistant stopped speaking - restoring energy threshold")
-        self.speaking = False
-        # Restore the energy threshold to normal level
-        # The mic has been listening the whole time, just with a higher threshold
-        if hasattr(self.audio_manager, 'set_assistant_speaking'):
-            self.audio_manager.set_assistant_speaking(False)
+        try:
+            logger.info("Assistant stopped speaking - restoring energy threshold")
+            self.speaking = False
+            # Restore the energy threshold to normal level
+            # The mic has been listening the whole time, just with a higher threshold
+            if self.running and hasattr(self.audio_manager, 'set_assistant_speaking') and self.audio_manager:
+                try:
+                    self.audio_manager.set_assistant_speaking(False)
+                except Exception as e:
+                    logger.error(f"Error restoring energy threshold: {e}")
+                    # Don't re-raise, continue execution
+        except Exception as e:
+            logger.error(f"Uncaught exception in _on_speaking_stopped: {e}")
+            logger.error(traceback.format_exc())
+            # Don't propagate any exceptions to prevent program termination
     
     def signal_handler(self, sig, frame):
         """Handle interrupt signals"""
-        logger.info(f"Received signal {sig}, shutting down...")
-        self.running = False
-        self.cleanup()
-        sys.exit(0)
-        
+        try:
+            signal_name = {
+                signal.SIGINT: "SIGINT (Ctrl+C)",
+                signal.SIGTERM: "SIGTERM",
+                signal.SIGABRT: "SIGABRT",
+                signal.SIGBREAK: "SIGBREAK (Windows Ctrl+Break)" if hasattr(signal, 'SIGBREAK') else "UNKNOWN",
+            }.get(sig, f"Signal {sig}")
+            
+            logger.info(f"=== SIGNAL DEBUG: Received {signal_name}, initiating graceful shutdown ===")
+            print(f"\n🛑 Received {signal_name}, shutting down gracefully...")
+            
+            # CRITICAL: First ensure TTS is stopped to prevent any deadlocks
+            try:
+                if hasattr(self, 'tts') and self.tts:
+                    logger.info("=== SIGNAL DEBUG: Emergency stopping TTS ===")
+                    if hasattr(self.tts, 'stop'):
+                        self.tts.stop()
+                    logger.info("=== SIGNAL DEBUG: TTS stopped ===")
+            except Exception as tts_error:
+                logger.error(f"=== SIGNAL DEBUG: Error stopping TTS: {tts_error} ===")
+            
+            # Set running flag to false to initiate graceful shutdown
+            self.running = False
+            
+            # SIGTERM needs more immediate action
+            if sig == signal.SIGTERM:
+                logger.info("=== SIGNAL DEBUG: SIGTERM received, cleaning up and exiting ===")
+                # SIGTERM should be handled more carefully
+                try:
+                    self.cleanup()
+                    logger.info("=== SIGNAL DEBUG: Cleanup completed, exiting ===")
+                except Exception as cleanup_error:
+                    logger.error(f"=== SIGNAL DEBUG: Error during cleanup: {cleanup_error} ===")
+                
+                # Don't exit directly, set should_stop flag
+                self.should_stop = True
+                return
+            
+            # For all other signals, set the stop flag so the main loop handles shutdown
+            # This prevents abrupt termination that could leave resources in a bad state
+            logger.info(f"=== SIGNAL DEBUG: {signal_name} received, setting stop flag but continuing execution ===")
+            self.should_stop = True
+            
+            # The main loop will check should_stop and exit cleanly
+        except Exception as e:
+            logger.error(f"=== SIGNAL DEBUG: Error in signal handler: {e} ===")
+            logger.error(traceback.format_exc())
+            # Don't exit here, let the main loop handle it
+    
     def cleanup(self):
         """Clean up resources"""
         logger.info("Cleaning up resources...")
@@ -1388,29 +1442,58 @@ class StreamingMaxwell:
         try:
             # Stop the keyboard handler
             if hasattr(self, 'keyboard_handler'):
-                logger.info("Stopping keyboard handler...")
-                self.keyboard_handler.stop()
+                try:
+                    logger.info("Stopping keyboard handler...")
+                    self.keyboard_handler.stop()
+                    
+                    # Verify the thread has stopped
+                    if hasattr(self.keyboard_handler, 'thread') and self.keyboard_handler.thread:
+                        if self.keyboard_handler.thread.is_alive():
+                            logger.warning("Keyboard handler thread is still alive, waiting...")
+                            try:
+                                self.keyboard_handler.thread.join(timeout=2.0)
+                            except Exception as join_error:
+                                logger.error(f"Error joining keyboard handler thread: {join_error}")
+                except Exception as kh_error:
+                    logger.error(f"Error stopping keyboard handler: {kh_error}")
+                    # Continue with cleanup even if this fails
             
             # Clean up TTS
             if hasattr(self, 'tts'):
-                logger.info("Cleaning up TTS...")
-                self.tts.cleanup()
+                try:
+                    logger.info("Cleaning up TTS...")
+                    self.tts.cleanup()
+                except Exception as tts_error:
+                    logger.error(f"Error cleaning up TTS: {tts_error}")
+                    # Continue with cleanup even if this fails
                 
             # Clean up AudioManager
             if hasattr(self, 'audio_manager') and self.audio_manager:
-                logger.info("Stopping audio manager...")
-                self.audio_manager.stop()
+                try:
+                    logger.info("Stopping audio manager...")
+                    self.audio_manager.stop()
+                except Exception as am_error:
+                    logger.error(f"Error stopping audio manager: {am_error}")
+                    # Continue with cleanup even if this fails
             
             # Clean up MCP Tools if enabled
             if hasattr(self, 'mcp_tool_provider') and self.mcp_tool_provider:
-                logger.info("Stopping MCP Tool Provider...")
-                self.mcp_tool_provider.stop_server()
+                try:
+                    logger.info("Stopping MCP Tool Provider...")
+                    self.mcp_tool_provider.stop_server()
+                except Exception as mcp_error:
+                    logger.error(f"Error stopping MCP tool provider: {mcp_error}")
+                    # Continue with cleanup even if this fails
                 
             # Clean up LLM provider if it has a cleanup method
             if hasattr(self, 'llm_provider') and self.llm_provider:
-                logger.info("Cleaning up LLM provider...")
-                if hasattr(self.llm_provider, 'cleanup'):
-                    self.llm_provider.cleanup()
+                try:
+                    logger.info("Cleaning up LLM provider...")
+                    if hasattr(self.llm_provider, 'cleanup'):
+                        self.llm_provider.cleanup()
+                except Exception as llm_error:
+                    logger.error(f"Error cleaning up LLM provider: {llm_error}")
+                    # Continue with cleanup even if this fails
                 
             # Mark as cleaned up
             self.cleaned_up = True
@@ -1418,7 +1501,10 @@ class StreamingMaxwell:
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
             logger.error(traceback.format_exc())
-        
+            # Set cleaned_up flag even if there were errors
+            self.cleaned_up = True
+            logger.info("Cleanup completed with errors")
+    
     def speak(self, text):
         """Speak text with interrupt support"""
         if not text:
@@ -1433,59 +1519,118 @@ class StreamingMaxwell:
         
         try:
             # Play a beep sound when Maxwell starts speaking
-            self._play_sound(frequency=900, duration=70)  # Medium-pitched beep
-            
+            try:
+                self._play_sound(frequency=900, duration=70)  # Medium-pitched beep
+            except Exception as beep_error:
+                logger.error(f"Error playing beep sound: {beep_error}")
+                # Continue even if beep fails
+                
             # Tell audio manager that we're speaking to adjust threshold
-            if hasattr(self.audio_manager, 'set_assistant_speaking'):
-                self.audio_manager.set_assistant_speaking(True)
-                
-                # Add only distinctive phrases to the self-speech filter
-                # Don't add greetings, wake word responses, or other common phrases
-                # that might filter out legitimate user commands
-                if hasattr(self.audio_manager, 'recent_recognitions'):
-                    # Skip adding very short responses or common responses to the filter
-                    common_phrases = ["yes", "hello", "hi", "hey", "okay", "sure", 
-                                     "yes?", "I'm listening", "I'm here", "go ahead"]
+            if hasattr(self.audio_manager, 'set_assistant_speaking') and self.audio_manager:
+                try:
+                    self.audio_manager.set_assistant_speaking(True)
                     
-                    if len(text.strip()) > 8 and not any(text.lower().startswith(phrase.lower()) for phrase in common_phrases):
-                        # Split long responses into shorter phrases
-                        sentences = re.split(r'[.!?]\s+', text)
-                        for sentence in sentences:
-                            # Only add substantial sentences, not simple acknowledgments
-                            if sentence and len(sentence.strip()) > 10:
-                                self.audio_manager.recent_recognitions.append(sentence.strip())
-                                logger.debug(f"Added to speech filter: '{sentence.strip()}'")
-                
+                    # Add only distinctive phrases to the self-speech filter
+                    # Don't add greetings, wake word responses, or other common phrases
+                    # that might filter out legitimate user commands
+                    if hasattr(self.audio_manager, 'recent_recognitions'):
+                        # Skip adding very short responses or common responses to the filter
+                        common_phrases = ["yes", "hello", "hi", "hey", "okay", "sure", 
+                                        "yes?", "I'm listening", "I'm here", "go ahead"]
+                        
+                        if len(text.strip()) > 8 and not any(text.lower().startswith(phrase.lower()) for phrase in common_phrases):
+                            # Split long responses into shorter phrases
+                            sentences = re.split(r'[.!?]\s+', text)
+                            for sentence in sentences:
+                                # Only add substantial sentences, not simple acknowledgments
+                                if sentence and len(sentence.strip()) > 10:
+                                    self.audio_manager.recent_recognitions.append(sentence.strip())
+                                    logger.debug(f"Added to speech filter: '{sentence.strip()}'")
+                except Exception as am_error:
+                    logger.error(f"Error setting assistant speaking state: {am_error}")
+                    # Continue even if setting speaking state fails
+            
             # Add a small delay to ensure thresholds are adjusted
-            time.sleep(0.2)
+            try:
+                time.sleep(0.2)
+            except Exception:
+                # Ignore interrupts during the delay
+                pass
                 
             # Use direct audio playback - will be stopped by space bar handler
-            self.tts.speak(text)
+            try:
+                # Check if self.tts is valid before calling speak
+                if hasattr(self, 'tts') and self.tts:
+                    self.tts.speak(text)
+                    
+                    # Wait for speech to complete
+                    while hasattr(self, 'tts') and self.tts and self.tts.is_speaking():
+                        try:
+                            time.sleep(0.1)
+                        except KeyboardInterrupt:
+                            logger.warning("KeyboardInterrupt during speech wait - continuing")
+                            break
+                        except Exception as wait_error:
+                            logger.error(f"Error during speech wait: {wait_error}")
+                            break
+                else:
+                    logger.error("TTS not available for speech")
+            except KeyboardInterrupt as k:
+                # Handle Ctrl+C directly during speech
+                print("\n🛑 Speech interrupted by KeyboardInterrupt (Ctrl+C)")
+                try:
+                    if hasattr(self, 'tts') and self.tts:
+                        self.tts.stop()
+                except Exception as stop_error:
+                    logger.error(f"Error stopping TTS during KeyboardInterrupt: {stop_error}")
+                
+                # Don't re-raise the KeyboardInterrupt as it could terminate the program
+                logger.warning("Captured KeyboardInterrupt during speech - continuing execution")
+            except Exception as speak_error:
+                logger.error(f"Error during TTS speak: {speak_error}")
+                logger.error(traceback.format_exc())
+                # Continue execution despite speech errors
             
-            # Wait for speech to complete
-            while self.tts.is_speaking():
-                time.sleep(0.1)
-            
-            # Play a beep when Maxwell finishes speaking normally
-            self._play_sound(frequency=850, duration=70)  # Medium-pitched beep
+            # Play a beep when Maxwell finishes speaking normally (if not interrupted)
+            try:
+                if hasattr(self, 'tts') and self.tts and not self.tts.is_speaking():
+                    self._play_sound(frequency=850, duration=70)  # Medium-pitched beep
+            except Exception as beep_error:
+                logger.error(f"Error playing end beep: {beep_error}")
+                # Continue even if end beep fails
             
             # Add a shorter pause after speaking to avoid cutting off
-            time.sleep(0.3)
+            try:
+                time.sleep(0.3)
+            except Exception:
+                # Ignore interrupts during the delay
+                pass
             
         except KeyboardInterrupt:
-            # Handle Ctrl+C directly during speech
+            # Catch and handle Ctrl+C again as a safety net
             print("\n🛑 Speech interrupted by user")
-            self.tts.stop()
+            logger.warning("Handling KeyboardInterrupt at outer level")
+            try:
+                if hasattr(self, 'tts') and self.tts:
+                    self.tts.stop()
+            except Exception as e:
+                logger.error(f"Error stopping TTS: {e}")
             
             # Play a beep when speech is interrupted
-            self._play_sound(frequency=600, duration=120)  # Lower-pitched longer beep for interruption
+            try:
+                self._play_sound(frequency=600, duration=120)  # Lower-pitched longer beep for interruption
+            except Exception as beep_error:
+                logger.error(f"Error playing interrupt beep: {beep_error}")
         except Exception as e:
             logger.error(f"Error in speak: {e}")
             logger.error(traceback.format_exc())
         finally:
             # Restore normal energy threshold
-            if hasattr(self.audio_manager, 'set_assistant_speaking'):
-                self.audio_manager.set_assistant_speaking(False)
+            try:
+                if hasattr(self.audio_manager, 'set_assistant_speaking') and self.audio_manager:
+                    self.audio_manager.set_assistant_speaking(False)
+            except Exception as threshold_error:
+                logger.error(f"Error restoring energy threshold: {threshold_error}")
                 
             # Clear speaking flag
             self.speaking = False
@@ -1711,29 +1856,48 @@ class StreamingMaxwell:
     
     def run(self):
         """Main loop for the assistant"""
+        initial_greeting_complete = False
+        self.space_key_hit = False
+        
         logger.info("StreamingMaxwell is running")
         print("\n🤖 Maxwell Assistant is starting up...")
         
         try:
-            # Start the keyboard handler
-            self.keyboard_handler.start(self.tts)
-            logger.info("Keyboard handler started - SPACE key will interrupt speech")
-            
+            # Start the keyboard handler with special space key callback
+            try:
+                # Add a custom space key callback to handle space during startup
+                self.space_key_callback = self._handle_space_key_during_startup
+                self.keyboard_handler.set_space_key_callback(self.space_key_callback)
+                
+                # Start the keyboard handler
+                self.keyboard_handler.start(self.tts)
+                logger.info("Keyboard handler started - SPACE key will interrupt speech")
+            except Exception as kh_error:
+                logger.error(f"Failed to start keyboard handler: {kh_error}")
+                logger.error(traceback.format_exc())
+                print("⚠️ Warning: Keyboard interruption may not work properly")
             
             # Start MCP tool provider if enabled
             if self.enable_mcp and self.mcp_tool_provider:
-                logger.info("Starting MCP tool provider...")
-                print(f"🔧 MCP tools integration enabled")
-                
-                # Log available tools
-                available_tools = self.mcp_tool_provider.get_tool_descriptions()
-                tool_names = list(available_tools.keys())
-                logger.info(f"Available MCP tools: {', '.join(tool_names)}")
-                
-                # Register MCP tools with command executor
-                if self.command_executor:
-                    logger.info("Registering MCP tools with command executor")
-                    self.command_executor._register_mcp_tools()
+                try:
+                    logger.info("Starting MCP tool provider...")
+                    self.mcp_tool_provider.start_server()
+                    self.tool_provider_started = True
+                    print(f"🔧 MCP tools integration enabled")
+                    
+                    # Log available tools
+                    available_tools = self.mcp_tool_provider.get_tool_descriptions()
+                    tool_names = list(available_tools.keys())
+                    logger.info(f"Available MCP tools: {', '.join(tool_names)}")
+                    
+                    # Register MCP tools with command executor
+                    if self.command_executor:
+                        logger.info("Registering MCP tools with command executor")
+                        self.command_executor._register_mcp_tools()
+                except Exception as mcp_error:
+                    logger.error(f"Failed to start MCP tool provider: {mcp_error}")
+                    logger.error(traceback.format_exc())
+                    print("⚠️ Warning: MCP tools may not be available")
             
             # Print LLM provider information if available
             llm_provider_type = self.config.get('llm_provider', 'none').lower()
@@ -1762,32 +1926,89 @@ class StreamingMaxwell:
                 
             # Initialize the audio manager if not already done
             if not self.audio_manager:
-                mic_index = getattr(self.config, 'mic_index', None)
-                energy_threshold = getattr(self.config, 'energy_threshold', 300)
-                
-                self.audio_manager = StreamingAudioManager(
-                    mic_index=mic_index,
-                    energy_threshold=energy_threshold
-                )
-                
-                # Set callbacks
-                self.audio_manager.on_speech_detected = self._on_speech_detected
-                self.audio_manager.on_speech_recognized = self._on_speech_recognized
-                
-                # Connect the speech callbacks if available
-                if hasattr(self.tts, 'on_speaking_started'):
-                    self.tts.on_speaking_started = self._on_speaking_started
-                    self.tts.on_speaking_stopped = self._on_speaking_stopped
-                    logger.info("Connected speech state callbacks")
+                try:
+                    mic_index = getattr(self.config, 'mic_index', None)
+                    energy_threshold = getattr(self.config, 'energy_threshold', 300)
+                    
+                    self.audio_manager = StreamingAudioManager(
+                        mic_index=mic_index,
+                        energy_threshold=energy_threshold
+                    )
+                    
+                    # Set callbacks
+                    self.audio_manager.on_speech_detected = self._on_speech_detected
+                    self.audio_manager.on_speech_recognized = self._on_speech_recognized
+                    
+                    # Connect the speech callbacks if available
+                    if hasattr(self.tts, 'on_speaking_started'):
+                        self.tts.on_speaking_started = self._on_speaking_started
+                        self.tts.on_speaking_stopped = self._on_speaking_stopped
+                        logger.info("Connected speech state callbacks")
+                except Exception as am_error:
+                    logger.error(f"Failed to initialize audio manager: {am_error}")
+                    logger.error(traceback.format_exc())
+                    print("❌ Error: Failed to initialize audio manager")
+                    return False
                 
             # Start the audio manager
-            print(f"🎤 Listening for wake word: '{self.wake_word}'")
-            self.audio_manager.start(wake_word=self.wake_word, interrupt_word=self.interrupt_word)
+            try:
+                print(f"🎤 Listening for wake word: '{self.wake_word}'")
+                self.audio_manager.start(wake_word=self.wake_word, interrupt_word=self.interrupt_word)
+            except Exception as start_error:
+                logger.error(f"Failed to start audio manager: {start_error}")
+                logger.error(traceback.format_exc())
+                print("❌ Error: Failed to start audio manager")
+                return False
             
-            # Announce startup
+            # Announce startup - wrap this in extra protection since it's where space bar is often pressed
             print("\n🚀 Maxwell is ready!")
-            self.speak(f"Hello, Maxwell here. Say '{self.wake_word}' to get my attention.")
-            
+            try:
+                # Special handling for initial greeting
+                self.speaking = True
+                # Signal that we're doing the initial greeting
+                logger.info("Starting initial greeting - applying special protection")
+                
+                # Directly call TTS to avoid complex speak method during initial greeting
+                if hasattr(self, 'tts') and self.tts:
+                    # Print message but use a simpler speak routine
+                    print(f"🔊 Maxwell: \"Hello, Maxwell here. Say '{self.wake_word}' to get my attention.\"")
+                    print("(Press SPACE to interrupt speech)")
+                    
+                    try:
+                        # Directly generate audio without the full speak method
+                        logger.info(f"Speaking: Hello, Maxwell here. Say '{self.wake_word}' to get my attention.")
+                        self.tts.speak(f"Hello, Maxwell here. Say '{self.wake_word}' to get my attention.")
+                        
+                        # Wait for speech to complete or be interrupted
+                        try:
+                            while self.tts.is_speaking():
+                                time.sleep(0.1)
+                        except Exception as wait_error:
+                            logger.warning(f"Initial greeting was interrupted or errored: {wait_error}")
+                    except Exception as speak_error:
+                        logger.error(f"Error during initial greeting: {speak_error}")
+                        logger.error(traceback.format_exc())
+                    finally:
+                        # Ensure speaking flag is cleared
+                        self.speaking = False
+                        
+                        # Ensure energy threshold is restored
+                        try:
+                            if hasattr(self.audio_manager, 'set_assistant_speaking') and self.audio_manager:
+                                self.audio_manager.set_assistant_speaking(False)
+                        except Exception as am_error:
+                            logger.error(f"Error restoring energy threshold after initial greeting: {am_error}")
+                        
+                        # Mark greeting as complete
+                        initial_greeting_complete = True
+                        logger.info("Initial greeting completed or interrupted, continuing...")
+                else:
+                    logger.error("TTS not available for initial greeting")
+            except Exception as greeting_error:
+                logger.error(f"Error during initial greeting: {greeting_error}")
+                logger.error(traceback.format_exc())
+                # Continue even if greeting fails
+                
             # Print some helpful info
             print(f"🔊 Say '{self.wake_word}' followed by your query. For example:")
             print(f"🗣️  '{self.wake_word}, what time is it?'")
@@ -1797,9 +2018,53 @@ class StreamingMaxwell:
             print("⌨️  Press Ctrl+C to exit")
             
             # Main loop - just keep the process alive
-            while not self.should_stop:
-                time.sleep(0.1)
+            max_errors = 5
+            error_count = 0
+            
+            # Check if space was hit before reaching the main loop
+            if self.space_key_hit:
+                logger.warning("=== SPACE KEY DEBUG: Space key was hit during startup, but continuing ===")
+                # Reset the flag to continue
+                self.space_key_hit = False
                 
+            while not self.should_stop:
+                try:
+                    # Check if space was hit
+                    if self.space_key_hit:
+                        logger.info("=== SPACE KEY DEBUG: Space key hit detected in main loop, resetting flag ===")
+                        self.space_key_hit = False
+                        
+                    time.sleep(0.1)
+                    # Reset error count during normal operation
+                    error_count = 0
+                except KeyboardInterrupt:
+                    # Handle keyboard interrupt directly in the main loop
+                    logger.info("Keyboard interrupt received in main loop")
+                    print("\n👋 Keyboard interrupt received. Press again to exit.")
+                    
+                    # Give user a chance to press Ctrl+C again to exit
+                    try:
+                        time.sleep(1)
+                    except KeyboardInterrupt:
+                        logger.info("Second keyboard interrupt, initiating shutdown...")
+                        print("\n👋 Shutting down...")
+                        self.should_stop = True
+                except Exception as e:
+                    # Handle other exceptions in the main loop
+                    logger.error(f"Error in main loop: {e}")
+                    logger.error(traceback.format_exc())
+                    
+                    # Count errors and exit if too many occur in succession
+                    error_count += 1
+                    if error_count > max_errors:
+                        logger.error(f"Too many consecutive errors ({error_count}), shutting down")
+                        self.should_stop = True
+                    
+                    # Sleep a bit longer after an error to avoid tight error loops
+                    time.sleep(0.5)
+                
+            logger.info("Main loop exited, performing cleanup...")
+            self.cleanup()
             return True
             
         except KeyboardInterrupt:
@@ -1808,12 +2073,38 @@ class StreamingMaxwell:
             self.cleanup()
             
         except Exception as e:
-            logger.error(f"Error in main loop: {e}")
+            logger.error(f"Fatal error in main loop: {e}")
             logger.error(traceback.format_exc())
             print(f"❌ Error: {e}")
             self.cleanup()
             
         return False
+    
+    def _handle_space_key_during_startup(self):
+        """Special handler for space key during startup to prevent program termination"""
+        logger.warning("=== SPACE KEY DEBUG: Space key pressed during startup/greeting ===")
+        
+        # Set a flag that we can check in the main loop
+        self.space_key_hit = True
+        
+        # Try to stop TTS directly
+        try:
+            if hasattr(self, 'tts') and self.tts:
+                logger.info("=== SPACE KEY DEBUG: Stopping TTS during startup ===")
+                if hasattr(self.tts, 'stop'):
+                    self.tts.stop()
+                logger.info("=== SPACE KEY DEBUG: TTS stopped during startup ===")
+        except Exception as e:
+            logger.error(f"=== SPACE KEY DEBUG: Error stopping TTS during startup: {e} ===")
+        
+        # Indicate that we've handled it
+        logger.info("=== SPACE KEY DEBUG: Space key during startup handled safely ===")
+        
+        # Play a sound to indicate interruption
+        try:
+            self._play_sound(frequency=600, duration=120)
+        except Exception:
+            pass
     
     def _play_listening_sound(self):
         """Play a sound to indicate we're listening"""
@@ -1938,7 +2229,6 @@ def main():
                           help="Always listen mode - no wake word needed")
                           
         # MCP integration
-        parser.add_argument('--use-mcp', action='store_true', help="Use MCP tool provider integration")
         parser.add_argument('--mcp-port', type=int, help="MCP API port")
         
         # Debug options
@@ -2040,7 +2330,7 @@ def main():
             config.always_listen = args.always_listen
             
             # MCP settings
-            config.use_mcp = args.use_mcp
+            # config.use_mcp = args.use_mcp  # Removed to prevent override - get from config.yaml only
             config.mcp_port = args.mcp_port
             
             # Support for getting configuration from a config.py file

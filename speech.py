@@ -209,47 +209,87 @@ class TextToSpeech:
             
     def stop(self):
         """Stop current speech"""
+        logger.info("=== TTS DEBUG: stop method STARTED ===")
         try:
             # Use a lock to prevent multiple stop calls from interfering with each other
+            logger.info("=== TTS DEBUG: Attempting to acquire speaking lock ===")
             with self._speaking_lock:
+                logger.info("=== TTS DEBUG: Speaking lock acquired ===")
                 # Only take action if we're actually speaking
                 if self._is_speaking:
-                    logger.info("Stopping TTS playback...")
+                    logger.info("=== TTS DEBUG: Is speaking = True, proceeding with stop ===")
                     try:
                         # Stop sounddevice playback
+                        logger.info("=== TTS DEBUG: About to call sd.stop() ===")
                         sd.stop()
-                        logger.info("TTS playback stopped")
+                        logger.info("=== TTS DEBUG: sd.stop() completed successfully ===")
                     except Exception as e:
-                        logger.error(f"Error stopping sounddevice playback: {e}")
+                        logger.error(f"=== TTS DEBUG: Error stopping sounddevice playback: {e} ===")
+                        logger.error(f"=== TTS DEBUG: Error type: {e.__class__.__name__} ===")
                         # Don't re-raise - we want to continue with cleanup
                     finally:
                         # Always update speaking state
+                        logger.info("=== TTS DEBUG: Setting _is_speaking = False ===")
                         self._is_speaking = False
                         
                         # Add small delay to ensure cleanup is complete
                         try:
+                            logger.info("=== TTS DEBUG: Starting post-stop delay ===")
                             time.sleep(0.1)
-                        except:
-                            pass
+                            logger.info("=== TTS DEBUG: Post-stop delay completed ===")
+                        except Exception as sleep_error:
+                            logger.error(f"=== TTS DEBUG: Error in post-stop delay: {sleep_error} ===")
+                            # Continue even if sleep fails
                     
                     # Call the speaking stopped callback if it exists - still inside lock to prevent race conditions
                     if self.on_speaking_stopped:
+                        logger.info("=== TTS DEBUG: on_speaking_stopped callback exists, preparing to call ===")
                         try:
+                            logger.info("=== TTS DEBUG: Calling on_speaking_stopped ===")
                             self.on_speaking_stopped()
+                            logger.info("=== TTS DEBUG: on_speaking_stopped completed successfully ===")
                         except Exception as e:
-                            logger.error(f"Error in on_speaking_stopped callback: {e}")
+                            logger.error(f"=== TTS DEBUG: Error in on_speaking_stopped callback: {e} ===")
+                            logger.error(f"=== TTS DEBUG: Error type: {e.__class__.__name__} ===")
+                            # Explicitly suppress any exceptions from callback to prevent program termination
+                            logger.error("=== TTS DEBUG: Suppressing exception from on_speaking_stopped to prevent program termination ===")
+                            # Don't re-raise - swallow the error completely
+                    else:
+                        logger.info("=== TTS DEBUG: No on_speaking_stopped callback exists ===")
                 else:
                     # Log but don't take action if we're not speaking
-                    logger.debug("Stop called but not currently speaking - ignoring")
+                    logger.debug("=== TTS DEBUG: Stop called but not currently speaking - ignoring ===")
+            
+            logger.info("=== TTS DEBUG: About to release speaking lock ===")
         except Exception as outer_e:
             # Catch-all to prevent any possible crash
-            logger.error(f"Unexpected error in TTS.stop method: {outer_e}")
+            logger.error(f"=== TTS DEBUG: Unexpected error in TTS.stop method: {outer_e} ===")
+            logger.error(f"=== TTS DEBUG: Error type: {outer_e.__class__.__name__} ===")
             try:
                 # Last resort attempt to stop the audio
+                logger.info("=== TTS DEBUG: Last resort - attempting emergency sd.stop() ===")
                 sd.stop()
-            except:
-                pass
-            
+                logger.info("=== TTS DEBUG: Emergency sd.stop() completed ===")
+            except Exception as emergency_e:
+                logger.error(f"=== TTS DEBUG: Error in emergency sd.stop(): {emergency_e} ===")
+        finally:
+            # Make absolutely sure we mark as not speaking
+            try:
+                self._is_speaking = False
+                logger.info("=== TTS DEBUG: Final safety: set _is_speaking = False ===")
+            except Exception as final_e:
+                logger.error(f"=== TTS DEBUG: Error in final safety check: {final_e} ===")
+        
+        logger.info("=== TTS DEBUG: stop method COMPLETED ===")
+        
+        # Safely ensure sounddevice is actually stopped, just in case
+        try:
+            # This is a redundant call, but it's a safety measure
+            sd.stop()
+            logger.info("=== TTS DEBUG: Final redundant sd.stop() completed ===")
+        except Exception as final_stop_error:
+            logger.error(f"=== TTS DEBUG: Error in final redundant sd.stop(): {final_stop_error} ===")
+        
     def is_speaking(self):
         """Check if currently speaking"""
         with self._speaking_lock:
