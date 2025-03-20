@@ -19,8 +19,8 @@ except ImportError:
     print("Google Search API not available, will use DuckDuckGo only")
 
 # Replace these with your actual keys if you have them
-GOOGLE_SEARCH_API_KEY = "AIzaSyD97tA7Lb8YwFvVcqQIZ3xF2eSuRdp_EOE"
-GOOGLE_CSE_ID = "a1690cf8f5fd742b9"  
+GOOGLE_SEARCH_API_KEY = os.getenv("GOOGLE_SEARCH_API_KEY")
+GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")  
 
 # Get the logger instance
 logger = logging.getLogger("maxwell")
